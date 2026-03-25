@@ -6,6 +6,8 @@ from typing import Any
 import jax
 import numpy as np
 
+from eqxview._capture import Capture as _Capture
+
 
 @dataclass
 class TreeNode:
@@ -135,6 +137,38 @@ def _flatten_with_path(
 
     _walk(model, ())
     return result
+
+
+def iter_module_paths(model: Any) -> list[tuple[str, Any]]:
+    """Return nested module paths for all submodules below `model`.
+
+    Paths are expressed relative to the model root and use the same path segment
+    conventions as `build_model_tree`, e.g. `blocks/0/linear1`.
+    """
+    from dataclasses import fields as dc_fields
+
+    results: list[tuple[str, Any]] = []
+
+    def _walk_value(value: Any, path_parts: list[str]) -> None:
+        if hasattr(value, "__dataclass_fields__"):
+            if path_parts:
+                results.append(("/".join(path_parts), value))
+            for field in dc_fields(value):
+                child = getattr(value, field.name, None)
+                _walk_value(child, path_parts + [field.name])
+            return
+
+        if isinstance(value, list):
+            for idx, item in enumerate(value):
+                _walk_value(item, path_parts + [str(idx)])
+            return
+
+        if isinstance(value, dict):
+            for key, item in value.items():
+                _walk_value(item, path_parts + [str(key)])
+
+    _walk_value(model, [])
+    return results
 
 
 def build_model_tree(model: Any) -> dict[str, Any]:
@@ -277,7 +311,38 @@ def build_operation_graph(model: Any) -> dict[str, Any]:
     depth_count = 0
     prev_id: str | None = None
 
-    def add_op_node(label: str, path: str, *, group: str | None = None) -> str:
+    # --- Capture detection -------------------------------------------------
+    # Find all Capture wrappers so their op nodes can be annotated.
+    _capture_at_path: dict[str, str] = {}
+    for _iter_path, _mod in iter_module_paths(model):
+        if isinstance(_mod, _Capture):
+            _capture_at_path[_iter_path] = _mod.name
+
+    def _strip_capture_module_segment(path: str) -> str:
+        """Hide redundant Capture internals, e.g. `embedding/module/...` -> `embedding/...`."""
+        for cap_path in _capture_at_path.keys():
+            inner_prefix = cap_path + "/module"
+            if path == inner_prefix:
+                return cap_path
+            if path.startswith(inner_prefix + "/"):
+                return cap_path + path[len(inner_prefix) :]
+        return path
+
+    def _capture_for_group_id(gid: str) -> tuple[str, str] | None:
+        """Return (capture_path, capture_name) if gid falls inside a Capture."""
+        for cap_path, cap_name in _capture_at_path.items():
+            if gid == cap_path or gid.startswith(cap_path + "/"):
+                return cap_path, cap_name
+        return None
+
+    def add_op_node(
+        label: str,
+        path: str,
+        *,
+        group: str | None = None,
+        capture_path: str | None = None,
+        capture_name: str | None = None,
+    ) -> str:
         nonlocal node_count, depth_count
         node_id = f"op:{node_count}"
         op_nodes.append(
@@ -288,6 +353,8 @@ def build_operation_graph(model: Any) -> dict[str, Any]:
                 "type": "operation",
                 "path": path,
                 "group": group,
+                "capture_path": capture_path,
+                "capture_name": capture_name,
             }
         )
         node_count += 1
@@ -295,16 +362,27 @@ def build_operation_graph(model: Any) -> dict[str, Any]:
         return node_id
 
     for idx, group in enumerate(groups):
-        group_path = "/".join(group["path"])
+        raw_group_path = "/".join(group["path"])
         # Use the path (minus model root) as group id for hierarchical collapsing
-        group_id = "/".join(group["path"][1:]) if len(group["path"]) > 1 else group_path
+        raw_group_id = (
+            "/".join(group["path"][1:]) if len(group["path"]) > 1 else raw_group_path
+        )
+        group_id = _strip_capture_module_segment(raw_group_id)
+        group_path = _strip_capture_module_segment(raw_group_path)
         leaves_by_name = {
             leaf.get("name", "tensor"): leaf
             for leaf in group["leaves"]
             if leaf.get("shape") is not None
         }
 
-        matmul_id = add_op_node(f"MatMul {idx}", f"{group_path}/matmul", group=group_id)
+        _cap_info = _capture_for_group_id(group_id)
+        _cap_path = _cap_info[0] if _cap_info else None
+        _cap_name = _cap_info[1] if _cap_info else None
+
+        matmul_id = add_op_node(
+            f"MatMul {idx}", f"{group_path}/matmul",
+            group=group_id, capture_path=_cap_path, capture_name=_cap_name,
+        )
         if prev_id is None:
             op_edges.append(
                 {
@@ -350,7 +428,8 @@ def build_operation_graph(model: Any) -> dict[str, Any]:
             b_shape = bias_leaf.get("shape")
             b_dtype = bias_leaf.get("dtype")
             addbias_id = add_op_node(
-                f"AddBias {idx}", f"{group_path}/addbias", group=group_id
+                f"AddBias {idx}", f"{group_path}/addbias",
+                group=group_id, capture_path=_cap_path, capture_name=_cap_name,
             )
             op_edges.append(
                 {
@@ -378,7 +457,8 @@ def build_operation_graph(model: Any) -> dict[str, Any]:
         is_last_group = idx == (len(groups) - 1)
         if not is_last_group:
             act_id = add_op_node(
-                f"Activation {idx}", f"{group_path}/activation", group=group_id
+                f"Activation {idx}", f"{group_path}/activation",
+                group=group_id, capture_path=_cap_path, capture_name=_cap_name,
             )
             op_edges.append(
                 {

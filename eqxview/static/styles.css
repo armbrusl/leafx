@@ -16,6 +16,9 @@
   --layer-fill: #1a2a3a;
   --layer-stroke: #6bb8d6;
   --layer-text: #a0d8ef;
+  --capture-fill: #0d2a1e;
+  --capture-stroke: #20d6ae;
+  --capture-text: #80f0d0;
   --input-fill: #0a2e24;
   --output-fill: #1e1a30;
   --output-stroke: #b07aff;
@@ -50,6 +53,9 @@
   --layer-fill: #e0ecf4;
   --layer-stroke: #4a90b0;
   --layer-text: #2a6080;
+  --capture-fill: #d4f4ec;
+  --capture-stroke: #0fa882;
+  --capture-text: #0a6050;
   --input-fill: #d4f0e6;
   --output-fill: #e8e0f4;
   --output-stroke: #7a50c0;
@@ -280,6 +286,17 @@ body {
   font: 9px "IBM Plex Mono", monospace;
 }
 
+.group-hull rect {
+  stroke-width: 1px;
+  vector-effect: non-scaling-stroke;
+}
+
+.group-hull text {
+  font: 8px "IBM Plex Mono", monospace;
+  opacity: 0.92;
+  pointer-events: none;
+}
+
 .param-node rect {
   fill: var(--param-fill);
   stroke: none;
@@ -302,15 +319,27 @@ body {
 
 .layer-node rect {
   fill: var(--layer-fill);
-  stroke: var(--layer-stroke);
-  stroke-width: 1.6px;
-  stroke-dasharray: 5 3;
+  stroke: none;
+  stroke-width: 0;
+  stroke-dasharray: none;
 }
 
 .layer-node text {
   fill: var(--layer-text);
   font: 10px "IBM Plex Mono", monospace;
   font-weight: 600;
+}
+
+.capture-node rect {
+  fill: var(--capture-fill);
+  stroke: none;
+  stroke-width: 0;
+  stroke-dasharray: none;
+}
+
+.capture-node text {
+  fill: var(--capture-text);
+  font: 9px "IBM Plex Mono", monospace;
 }
 
 .io-node rect {
@@ -367,7 +396,7 @@ body {
 .link {
   fill: none;
   stroke: var(--link-stroke);
-  stroke-width: 2.8px;
+  stroke-width: 1.4px;
 }
 
 .link-flow {
@@ -376,7 +405,7 @@ body {
 
 .link-param {
   stroke: var(--accent-2);
-  stroke-width: 2.8px;
+  stroke-width: 1.4px;
 }
 
 .edge-label {

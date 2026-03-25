@@ -7,6 +7,7 @@ Current scope:
 - inspect an operation-style graph left-to-right
 - render tensor-carrying edges (including parameter edges such as weight/bias)
 - show summary stats (parameter count, bytes, leaf count)
+- run the loaded model on a dropped `.npy` INPUT tensor and inspect OUTPUT shape/values
 
 ## Quick start
 
@@ -40,25 +41,39 @@ http://127.0.0.1:8000
 Drag one file into the browser window.
 
 Supported file extensions:
+- .eqxbundle
 - .pkl
 - .pickle
 - .cloudpickle
 
-Recommended format right now: cloudpickle of a fully instantiated model object.
+Recommended format right now: `.eqxbundle` containing factory metadata plus
+`eqx.tree_serialise_leaves` weights.
 
 Example exporter:
 
 ```python
-import cloudpickle
-import equinox as eqx
 import jax.random as jr
 
-model = eqx.nn.MLP(in_size=32, out_size=4, width_size=64, depth=3, key=jr.PRNGKey(0))
-with open("model.cloudpickle", "wb") as f:
-	cloudpickle.dump(model, f)
+from example_models import make_mlp
+from eqxview.model_loading import save_model_bundle
+
+model = make_mlp(in_size=32, out_size=4, width=64, depth=3, seed=0)
+save_model_bundle(
+	model,
+	"model.eqxbundle",
+	factory_spec="example_models:make_mlp",
+	factory_kwargs={"in_size": 32, "out_size": 4, "width": 64, "depth": 3, "seed": 0},
+)
 ```
 
-Security note: unpickling executes Python code. Keep this local and only drop files you trust.
+Security note: pickle-based formats still execute Python code on load. Prefer `.eqxbundle`
+when possible, and keep all model loading local to trusted code.
+
+## Run inference from browser input
+
+After loading a model, drop a `.npy` tensor directly onto the `INPUT` node.
+eqxview will run a forward pass on the loaded model and populate the `OUTPUT` node
+with inferred output shape and a heatmap preview of output values.
 
 ## Notes for large models
 

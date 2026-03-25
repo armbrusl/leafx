@@ -7,6 +7,9 @@ import jax.numpy as jnp
 import equinox as eqx
 import cloudpickle
 
+import eqxview
+from eqxview.model_loading import save_model_bundle
+
 
 def make_mlp(
     in_size: int = 32,
@@ -28,6 +31,68 @@ def make_mlp(
     cloudpickle.dumps(model)  # smoke test for pickling
 
     return model
+
+
+def make_residual_mlp(
+    in_size: int = 128,
+    hidden: int = 256,
+    n_blocks: int = 4,
+    out_size: int = 10,
+    seed: int = 0,
+):
+    return ComplexModel(
+        in_size=in_size,
+        hidden=hidden,
+        n_blocks=n_blocks,
+        out_size=out_size,
+        key=jr.PRNGKey(seed),
+    )
+
+
+def make_conv_classifier(
+    in_channels: int = 3,
+    hidden: int = 16,
+    out_size: int = 10,
+    seed: int = 0,
+):
+    return ConvClassifier(
+        in_channels=in_channels,
+        hidden=hidden,
+        out_size=out_size,
+        key=jr.PRNGKey(seed),
+    )
+
+
+def make_token_attention(
+    vocab: int = 256,
+    d_model: int = 64,
+    n_heads: int = 4,
+    out_size: int = 8,
+    seed: int = 0,
+):
+    return TokenAttentionModel(
+        vocab=vocab,
+        d_model=d_model,
+        n_heads=n_heads,
+        out_size=out_size,
+        key=jr.PRNGKey(seed),
+    )
+
+
+def make_recurrent_cells(
+    vocab: int = 128,
+    d_model: int = 32,
+    hidden: int = 48,
+    out_size: int = 6,
+    seed: int = 0,
+):
+    return RecurrentCellsModel(
+        vocab=vocab,
+        d_model=d_model,
+        hidden=hidden,
+        out_size=out_size,
+        key=jr.PRNGKey(seed),
+    )
 
 
 class ResBlock(eqx.Module):
@@ -94,31 +159,37 @@ class ConvClassifier(eqx.Module):
 
 
 class TokenAttentionModel(eqx.Module):
-    embedding: eqx.nn.Embedding
-    attn: eqx.nn.MultiheadAttention
+    embedding: eqxview.Capture
+    attn: eqxview.Capture
     norm: eqx.nn.LayerNorm
     dropout: eqx.nn.Dropout
-    head: eqx.nn.Linear
+    head: eqxview.Capture
 
     def __init__(self, vocab=256, d_model=64, n_heads=4, out_size=8, *, key):
         k1, k2, k3 = jr.split(key, 3)
-        self.embedding = eqx.nn.Embedding(
-            num_embeddings=vocab, embedding_size=d_model, key=k1
+        self.embedding = eqxview.Capture(
+            eqx.nn.Embedding(num_embeddings=vocab, embedding_size=d_model, key=k1),
+            name="token_emb",
         )
-        self.attn = eqx.nn.MultiheadAttention(
-            num_heads=n_heads,
-            query_size=d_model,
-            key_size=d_model,
-            value_size=d_model,
-            output_size=d_model,
-            use_output_bias=True,
-            dropout_p=0.0,
-            inference=True,
-            key=k2,
+        self.attn = eqxview.Capture(
+            eqx.nn.MultiheadAttention(
+                num_heads=n_heads,
+                query_size=d_model,
+                key_size=d_model,
+                value_size=d_model,
+                output_size=d_model,
+                use_output_bias=True,
+                dropout_p=0.0,
+                inference=True,
+                key=k2,
+            ),
+            name="attention",
         )
         self.norm = eqx.nn.LayerNorm((d_model,))
         self.dropout = eqx.nn.Dropout(p=0.1, inference=True)
-        self.head = eqx.nn.Linear(d_model, out_size, key=k3)
+        self.head = eqxview.Capture(
+            eqx.nn.Linear(d_model, out_size, key=k3), name="logits"
+        )
 
     def __call__(self, token_ids):
         x = self.embedding(token_ids)
@@ -129,21 +200,28 @@ class TokenAttentionModel(eqx.Module):
 
 
 class RecurrentCellsModel(eqx.Module):
-    embedding: eqx.nn.Embedding
-    gru: eqx.nn.GRUCell
-    lstm: eqx.nn.LSTMCell
-    head: eqx.nn.Linear
+    embedding: eqxview.Capture
+    gru: eqxview.Capture
+    lstm: eqxview.Capture
+    head: eqxview.Capture
     hidden_size: int
 
     def __init__(self, vocab=128, d_model=32, hidden=48, out_size=6, *, key):
         k1, k2, k3, k4 = jr.split(key, 4)
         self.hidden_size = hidden
-        self.embedding = eqx.nn.Embedding(
-            num_embeddings=vocab, embedding_size=d_model, key=k1
+        self.embedding = eqxview.Capture(
+            eqx.nn.Embedding(num_embeddings=vocab, embedding_size=d_model, key=k1),
+            name="token_emb",
         )
-        self.gru = eqx.nn.GRUCell(d_model, hidden, key=k2)
-        self.lstm = eqx.nn.LSTMCell(hidden, hidden, key=k3)
-        self.head = eqx.nn.Linear(hidden, out_size, key=k4)
+        self.gru = eqxview.Capture(
+            eqx.nn.GRUCell(d_model, hidden, key=k2), name="gru_hidden"
+        )
+        self.lstm = eqxview.Capture(
+            eqx.nn.LSTMCell(hidden, hidden, key=k3), name="lstm_hidden"
+        )
+        self.head = eqxview.Capture(
+            eqx.nn.Linear(hidden, out_size, key=k4), name="logits"
+        )
 
     def __call__(self, token_ids):
         x = self.embedding(token_ids)
@@ -181,6 +259,31 @@ def build_model_zoo(seed: int = 42) -> dict[str, eqx.Module]:
     return models
 
 
+def build_model_zoo_specs(seed: int = 42) -> dict[str, dict[str, object]]:
+    return {
+        "mlp_small": {
+            "factory": "example_models:make_mlp",
+            "factory_kwargs": {"in_size": 32, "out_size": 4, "width": 64, "depth": 2, "seed": seed},
+        },
+        "residual_mlp": {
+            "factory": "example_models:make_residual_mlp",
+            "factory_kwargs": {"in_size": 128, "hidden": 256, "n_blocks": 4, "out_size": 10, "seed": seed + 1},
+        },
+        "conv_classifier": {
+            "factory": "example_models:make_conv_classifier",
+            "factory_kwargs": {"in_channels": 3, "hidden": 16, "out_size": 10, "seed": seed + 2},
+        },
+        "token_attention": {
+            "factory": "example_models:make_token_attention",
+            "factory_kwargs": {"vocab": 256, "d_model": 64, "n_heads": 4, "out_size": 8, "seed": seed + 3},
+        },
+        "recurrent_cells": {
+            "factory": "example_models:make_recurrent_cells",
+            "factory_kwargs": {"vocab": 128, "d_model": 32, "hidden": 48, "out_size": 6, "seed": seed + 4},
+        },
+    }
+
+
 def export_model_zoo(output_dir: Path | None = None, seed: int = 42) -> list[Path]:
     out = output_dir or Path(__file__).parent
     out.mkdir(parents=True, exist_ok=True)
@@ -194,7 +297,26 @@ def export_model_zoo(output_dir: Path | None = None, seed: int = 42) -> list[Pat
     return paths
 
 
+def export_model_bundle_zoo(output_dir: Path | None = None, seed: int = 42) -> list[Path]:
+    out = output_dir or Path(__file__).parent
+    out.mkdir(parents=True, exist_ok=True)
+    models = build_model_zoo(seed=seed)
+    specs = build_model_zoo_specs(seed=seed)
+    paths: list[Path] = []
+    for name, model in models.items():
+        spec = specs[name]
+        path = out / f"{name}.eqxbundle"
+        save_model_bundle(
+            model,
+            path,
+            factory_spec=spec["factory"],
+            factory_kwargs=spec["factory_kwargs"],
+        )
+        paths.append(path)
+    return paths
+
+
 if __name__ == "__main__":
-    saved_paths = export_model_zoo()
+    saved_paths = export_model_bundle_zoo()
     for path in saved_paths:
         print(f"Saved {path.name} ({path.stat().st_size / 1024:.1f} KB)")

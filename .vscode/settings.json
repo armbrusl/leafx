@@ -5,11 +5,6 @@
             "envManager": "ms-python.python:venv",
             "packageManager": "ms-python.python:pip",
             "workspace": "jNO_docs"
-        },
-        {
-            "path": "",
-            "envManager": "ms-python.python:venv",
-            "packageManager": "ms-python.python:pip"
         }
     ]
 }
