@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>eqxview</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20" />
+    <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+    <script src="https://cdn.jsdelivr.net/npm/elkjs@0.9.3/lib/elk.bundled.js"></script>
+  </head>
+  <body>
+    <div class="bg-glow"></div>
+    <main class="app-shell">
+      <section class="hud card">
+        <h1>eqxview</h1>
+        <p class="hint">Drop a .pkl/.pickle/.cloudpickle file anywhere in this window.</p>
+        <div class="summary" id="summary">No model loaded.</div>
+        <div class="controls">
+          <button id="collapseBtn" class="ctrl-btn">Collapse All</button>
+          <button id="shapesBtn" class="ctrl-btn">Shapes</button>
+          <button id="heatmapBtn" class="ctrl-btn">Heatmaps</button>
+          <button id="themeBtn" class="ctrl-btn">Light</button>
+        </div>
+        <div class="inspector hidden" id="inspector"></div>
+        <p id="status" class="status">Waiting for drop.</p>
+      </section>
+      <section class="canvas-wrap">
+        <div id="viz"></div>
+      </section>
+    </main>
+    <div id="dropOverlay" class="drop-overlay" aria-hidden="true">
+      <div class="drop-overlay__card">Drop model file to visualize</div>
+    </div>
+
+    <script type="module" src="/static/main.js?v=53"></script>
+  </body>
+</html>

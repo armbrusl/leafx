@@ -1,0 +1,74 @@
+# eqxview
+
+eqxview is a local browser visualizer for Equinox model hierarchies.
+
+Current scope:
+- load a serialized model by dragging a file into the browser window
+- inspect an operation-style graph left-to-right
+- render tensor-carrying edges (including parameter edges such as weight/bias)
+- show summary stats (parameter count, bytes, leaf count)
+
+## Quick start
+
+1. Activate your environment:
+
+```bash
+cd /home/users/armbrust/projects/eqxview
+source .venv/bin/activate
+```
+
+2. Sync dependencies with uv:
+
+```bash
+uv sync
+```
+
+3. Start the local server:
+
+```bash
+uv run uvicorn eqxview.app:app --reload --host 127.0.0.1 --port 8000
+```
+
+4. Open in browser:
+
+```text
+http://127.0.0.1:8000
+```
+
+## Use your own model
+
+Drag one file into the browser window.
+
+Supported file extensions:
+- .pkl
+- .pickle
+- .cloudpickle
+
+Recommended format right now: cloudpickle of a fully instantiated model object.
+
+Example exporter:
+
+```python
+import cloudpickle
+import equinox as eqx
+import jax.random as jr
+
+model = eqx.nn.MLP(in_size=32, out_size=4, width_size=64, depth=3, key=jr.PRNGKey(0))
+with open("model.cloudpickle", "wb") as f:
+	cloudpickle.dump(model, f)
+```
+
+Security note: unpickling executes Python code. Keep this local and only drop files you trust.
+
+## Notes for large models
+
+- operation nodes are laid out left-to-right by depth
+- tensor labels are drawn on edges; parameter edges are highlighted
+- use browser zoom/pan for navigation
+- summary shows global parameter and memory size totals
+
+## Next extensions
+
+- parameter-mask extraction and save/load
+- per-subtree statistics (norms, sparsity, histograms)
+- architecture editing and round-trip export
