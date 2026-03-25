@@ -300,11 +300,14 @@ body {
 .param-node rect {
   fill: var(--param-fill);
   stroke: none;
+  cursor: pointer;
 }
 
 .param-node text {
   fill: var(--param-text);
   font: 8px "IBM Plex Mono", monospace;
+  cursor: pointer;
+  pointer-events: none;
 }
 
 .hm-stat-label {

@@ -23,6 +23,7 @@ let currentOutputHeatmap = null;
 let currentOutputStats = null;
 let currentNodeActivations = {};
 let expandedHeatmaps = new Set();
+let selectiveParamHeatmaps = new Set();
 let showShapes = false;
 let showHeatmaps = false;
 
@@ -871,8 +872,13 @@ async function renderOperationGraph(rawGraph) {
   }
 
   const { edgeShapes, nodeShapes } = inferEdgeShapes(graph);
-  const globalHeatRange = showHeatmaps ? { vmin: -1, vmax: 1 } : null;
+  const anyParamHeatmapVisible = showHeatmaps || selectiveParamHeatmaps.size > 0;
+  const globalHeatRange = anyParamHeatmapVisible ? { vmin: -1, vmax: 1 } : null;
   const finalCaptureNodeById = captureFinalNodeIds(graph);
+
+  function paramHeatmapVisible(paramId) {
+    return showHeatmaps || selectiveParamHeatmaps.has(paramId);
+  }
 
   function activationForNode(node) {
     if (!node?.capture_path) return null;
@@ -985,7 +991,7 @@ async function renderOperationGraph(rawGraph) {
   graph.edges.forEach((edge, idx) => {
     if (!edge.source) {
       const synthId = `param-src-${idx}`;
-      if (showHeatmaps && edge.values && edge.values.length) {
+      if (paramHeatmapVisible(synthId) && edge.values && edge.values.length) {
         const baseThumb = heatmapThumbSize(edge.values, edge.shape);
         const thumb = expandedHeatmaps.has(synthId) ? scaleThumbSize(baseThumb, 2.5) : baseThumb;
         if (thumb) {
@@ -1205,7 +1211,7 @@ async function renderOperationGraph(rawGraph) {
     if (d.shapeInfo?.shape) rows.push({ key: "shape", value: shapeStr(d.shapeInfo.shape) });
     if (d.shapeInfo?.dtype) rows.push({ key: "dtype", value: d.shapeInfo.dtype });
     if (d.shapeInfo?.bytes != null) rows.push({ key: "size", value: bytesStr(d.shapeInfo.bytes) });
-    if (showHeatmaps && d.values) {
+    if (paramHeatmapVisible(d.node.id) && d.values) {
       const st = valuesStats(d.values);
       if (st) {
         rows.push({ key: "min", value: st.min.toFixed(4) });
@@ -1268,6 +1274,28 @@ async function renderOperationGraph(rawGraph) {
     renderOperationGraph(currentGraph);
   }
 
+  function toggleTerminalParameterHeatmaps(nodeId) {
+    const paramIds = [];
+    graph.edges.forEach((edge, idx) => {
+      if (edge.kind === "parameter" && edge.target === nodeId) {
+        paramIds.push(`param-src-${idx}`);
+      }
+    });
+    if (!paramIds.length) return false;
+
+    const hasHidden = paramIds.some((id) => !selectiveParamHeatmaps.has(id));
+    if (hasHidden) {
+      paramIds.forEach((id) => selectiveParamHeatmaps.add(id));
+    } else {
+      paramIds.forEach((id) => {
+        selectiveParamHeatmaps.delete(id);
+        expandedHeatmaps.delete(id);
+      });
+    }
+    renderOperationGraph(currentGraph);
+    return true;
+  }
+
   function collapseGroup(d) {
     let targetPrefix = null;
 
@@ -1291,9 +1319,29 @@ async function renderOperationGraph(rawGraph) {
   }
 
   gOp.on("click", (event, d) => {
-    // Left click only expands collapsed nodes.
+    // Left click expands collapsed nodes; for visible activation heatmaps,
+    // it toggles expanded view even if the inner hit-rect misses the event.
     if (event.button !== 0) return;
-    expandOneLevel(d);
+    if (d.node._collapsed) {
+      const childPrefixes = d.node._collapsedPrefix
+        ? getChildPrefixes(currentGraph, d.node._collapsedPrefix)
+        : new Set();
+      // Terminal collapsed node: final click toggles attached parameter heatmaps.
+      if (!childPrefixes.size && toggleTerminalParameterHeatmaps(d.node.id)) return;
+      expandOneLevel(d);
+      return;
+    }
+    const activation = activationForNode(d.node);
+    if (showHeatmaps && activation?.heatmap?.length) {
+      if (expandedHeatmaps.has(d.node.id)) expandedHeatmaps.delete(d.node.id);
+      else expandedHeatmaps.add(d.node.id);
+      renderOperationGraph(currentGraph);
+      return;
+    }
+
+    // Final step for expanded terminal op nodes: toggle their attached
+    // parameter heatmaps if no activation heatmap is available.
+    toggleTerminalParameterHeatmaps(d.node.id);
   });
 
   gOp.on("contextmenu", (event, d) => {
@@ -1412,11 +1460,39 @@ async function renderOperationGraph(rawGraph) {
     showInspector("Parameter", parameterInspectorRows(d));
   }).on("mouseleave", () => hideInspector());
 
-  if (showHeatmaps) {
+  // Clicking a parameter node toggles its heatmap visibility (selective mode),
+  // or toggles expanded/collapsed if already visible.
+  gParam.on("click", (event, d) => {
+    if (event.button !== 0) return;
+    if (!d.values?.length) return;
+    if (paramHeatmapVisible(d.node.id)) {
+      // Already visible: toggle expanded size
+      if (expandedHeatmaps.has(d.node.id)) expandedHeatmaps.delete(d.node.id);
+      else expandedHeatmaps.add(d.node.id);
+    } else {
+      // Not visible: make it visible via selective set
+      selectiveParamHeatmaps.add(d.node.id);
+    }
+    renderOperationGraph(currentGraph);
+  });
+
+  // Right-click hides a selectively-visible parameter heatmap.
+  gParam.on("contextmenu", (event, d) => {
+    if (!d.values?.length) return;
+    if (selectiveParamHeatmaps.has(d.node.id)) {
+      event.preventDefault();
+      selectiveParamHeatmaps.delete(d.node.id);
+      expandedHeatmaps.delete(d.node.id);
+      renderOperationGraph(currentGraph);
+    }
+  });
+
+  if (showHeatmaps || selectiveParamHeatmaps.size > 0) {
     gParam.each(function (d) {
       const g = d3.select(this);
       const hasVals = d.values && d.values.length;
-      if (!hasVals) {
+      const showParamHm = hasVals && paramHeatmapVisible(d.node.id);
+      if (!showParamHm) {
         g.append("rect")
           .attr("x", -d.w / 2).attr("y", -d.h / 2)
           .attr("rx", 9).attr("width", d.w).attr("height", d.h);
@@ -1473,10 +1549,24 @@ async function renderOperationGraph(rawGraph) {
 
       hitRect.on("click", (event) => {
         event.stopPropagation();
-        if (!showHeatmaps || !d.values?.length) return;
-        if (expandedHeatmaps.has(d.node.id)) expandedHeatmaps.delete(d.node.id);
-        else expandedHeatmaps.add(d.node.id);
+        if (!d.values?.length) return;
+        if (paramHeatmapVisible(d.node.id)) {
+          if (expandedHeatmaps.has(d.node.id)) expandedHeatmaps.delete(d.node.id);
+          else expandedHeatmaps.add(d.node.id);
+        } else {
+          selectiveParamHeatmaps.add(d.node.id);
+        }
         renderOperationGraph(currentGraph);
+      });
+
+      hitRect.on("contextmenu", (event) => {
+        if (selectiveParamHeatmaps.has(d.node.id)) {
+          event.preventDefault();
+          event.stopPropagation();
+          selectiveParamHeatmaps.delete(d.node.id);
+          expandedHeatmaps.delete(d.node.id);
+          renderOperationGraph(currentGraph);
+        }
       });
 
       hitRect.on("dblclick", (event) => {
@@ -1968,6 +2058,7 @@ async function loadModelTreeFromFile(file) {
       : graphFromTree(data.tree);
     currentGraph = graph;
     clearCurrentOutput();
+    selectiveParamHeatmaps.clear();
     collapsedGroups.clear();
     // Start collapsed at top level by default.
     const tops = getTopLevelPrefixes(currentGraph);
