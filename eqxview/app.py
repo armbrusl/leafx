@@ -14,11 +14,12 @@ import numpy as np
 
 from eqxview._capture import Capture
 from eqxview.introspection import build_operation_graph, iter_module_paths
-from eqxview.model_loading import ModelLoadError, load_uploaded_model
+from eqxview.model_loading import LoadedModel, ModelLoadError, load_uploaded_model
+from eqxview.tensor_projection import flat_values_for_client, to_heatmap_2d
 
 
 app = FastAPI(title="eqxview", version="0.1.0")
-CURRENT_MODEL: Any | None = None
+CURRENT_LOADED: LoadedModel | None = None
 
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -27,30 +28,6 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(static_dir / "index.html")
-
-
-def _downsample_2d(arr: np.ndarray, max_size: int = 64) -> list[list[float]]:
-    rows, cols = arr.shape
-    if rows > max_size:
-        r_idx = np.linspace(0, rows - 1, max_size, dtype=int)
-        arr = arr[r_idx]
-    if cols > max_size:
-        c_idx = np.linspace(0, cols - 1, max_size, dtype=int)
-        arr = arr[:, c_idx]
-    return arr.astype(np.float32, copy=False).tolist()
-
-
-def _to_heatmap_2d(value: Any, max_size: int = 64) -> list[list[float]] | None:
-    arr = np.asarray(value)
-    if arr.ndim == 0:
-        return [[float(arr)]]
-    if arr.ndim == 1:
-        arr = arr.reshape(1, -1)
-    elif arr.ndim > 2:
-        while arr.ndim > 2:
-            arr = arr[0]
-    return _downsample_2d(arr, max_size=max_size)
-
 
 def _pick_primary_array_leaf(output_value: Any) -> Any:
     leaves = jax.tree_util.tree_leaves(output_value)
@@ -75,7 +52,8 @@ def _activation_payload(value: Any) -> dict[str, Any] | None:
         "shape": [int(v) for v in arr.shape],
         "dtype": str(arr.dtype),
         "bytes": int(arr.size * arr.dtype.itemsize),
-        "heatmap": _to_heatmap_2d(arr, max_size=64),
+        "heatmap": to_heatmap_2d(arr, max_size=64),
+        "flat_values": flat_values_for_client(arr),
         "stats": {
             "min": float(np.min(arr)),
             "max": float(np.max(arr)),
@@ -144,7 +122,7 @@ def _run_model_with_capture(
 
 @app.post("/api/introspect-upload")
 async def introspect_upload(file: UploadFile = File(...)) -> dict:
-    global CURRENT_MODEL
+    global CURRENT_LOADED
 
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing filename.")
@@ -154,22 +132,25 @@ async def introspect_upload(file: UploadFile = File(...)) -> dict:
     if not lowered.endswith(allowed_suffixes):
         raise HTTPException(
             status_code=400,
-            detail="Unsupported file type. Use .eqxbundle, .pkl, .pickle, or .cloudpickle.",
+            detail=(
+                "Unsupported file type. Use .eqxbundle or pickle formats "
+                "(.pkl/.pickle/.cloudpickle)."
+            ),
         )
 
     try:
         raw = await file.read()
-        model = load_uploaded_model(file.filename, raw)
+        loaded = load_uploaded_model(file.filename, raw)
     except ModelLoadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    CURRENT_MODEL = model
-    return build_operation_graph(model)
+    CURRENT_LOADED = loaded
+    return build_operation_graph(loaded.model, parameter_tree=loaded.parameter_tree)
 
 
 @app.post("/api/run-current-model")
 async def run_current_model(input_file: UploadFile = File(...)) -> dict[str, Any]:
-    if CURRENT_MODEL is None:
+    if CURRENT_LOADED is None:
         raise HTTPException(status_code=400, detail="No model loaded yet.")
 
     if not input_file.filename or not input_file.filename.lower().endswith(".npy"):
@@ -183,9 +164,17 @@ async def run_current_model(input_file: UploadFile = File(...)) -> dict[str, Any
 
     model_input = jnp.asarray(np_input)
     try:
-        output_value, activations = _run_model_with_capture(
-            CURRENT_MODEL, model_input
-        )
+        activations: dict[str, dict[str, Any]] = {}
+        if CURRENT_LOADED.framework == "equinox":
+            output_value, activations = _run_model_with_capture(
+                CURRENT_LOADED.model, model_input
+            )
+        elif CURRENT_LOADED.run_fn is not None:
+            output_value = CURRENT_LOADED.run_fn(model_input)
+        else:
+            raise RuntimeError(
+                f"Loaded {CURRENT_LOADED.framework} model is not runnable."
+            )
     except Exception as exc:
         raise HTTPException(
             status_code=400, detail=f"Model forward pass failed: {exc}"
@@ -197,7 +186,7 @@ async def run_current_model(input_file: UploadFile = File(...)) -> dict[str, Any
         raise HTTPException(status_code=400, detail=f"Output parsing failed: {exc}") from exc
 
     output_np = np.asarray(output_leaf)
-    heatmap = _to_heatmap_2d(output_np, max_size=64)
+    heatmap = to_heatmap_2d(output_np, max_size=64)
     stats = {
         "min": float(np.min(output_np)),
         "max": float(np.max(output_np)),
@@ -209,6 +198,7 @@ async def run_current_model(input_file: UploadFile = File(...)) -> dict[str, Any
         "shape": [int(v) for v in output_np.shape],
         "dtype": str(output_np.dtype),
         "heatmap": heatmap,
+        "flat_values": flat_values_for_client(output_np),
         "stats": stats,
         "activations": activations,
     }

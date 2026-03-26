@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>eqxview</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20" />
+    <link rel="stylesheet" href="/static/styles.css?v=25" />
     <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
     <script src="https://cdn.jsdelivr.net/npm/elkjs@0.9.3/lib/elk.bundled.js"></script>
   </head>
@@ -12,18 +12,32 @@
     <div class="bg-glow"></div>
     <main class="app-shell">
       <section class="hud card">
-        <h1>eqxview</h1>
-        <p class="hint">Drop a model file anywhere, then drop a .npy tensor onto INPUT to run inference.</p>
-        <div class="summary" id="summary">No model loaded.</div>
-        <div class="controls">
-          <button id="collapseBtn" class="ctrl-btn">Collapse All</button>
-          <button id="shapesBtn" class="ctrl-btn">Shapes</button>
-          <button id="heatmapBtn" class="ctrl-btn">Heatmaps</button>
-          <button id="themeBtn" class="ctrl-btn">Light</button>
+        <div class="hud-head">
+          <h1>eqxview</h1>
+          <button id="infoBtn" class="info-toggle" aria-label="Toggle help and details" aria-expanded="false">&#128161;</button>
         </div>
-        <div class="inspector hidden" id="inspector"></div>
-        <p id="status" class="status">Waiting for drop.</p>
+        <div class="summary" id="summary">Drag and Drop a model file to visualize.</div>
+        <div id="hudDetails" class="hud-details hidden">
+          <p class="hint">Drop a model file anywhere, then drop a <code>.npy</code> tensor onto INPUT to run inference.</p>
+          <div class="help-copy">
+            <div><span class="key">Views:</span> Default, Shapes, and Heatmaps at top-center.</div>
+            <div><span class="key">Theme:</span> Top-right Dark/Light button.</div>
+            <div><span class="key">Expand/Collapse:</span> Left-click to expand groups, right-click to collapse groups.</div>
+            <div><span class="key">Global toggle:</span> Double-left or double-right click the background.</div>
+            <div><span class="key">Heatmaps:</span> Click parameter nodes to reveal heatmaps and right-click to hide.</div>
+          </div>
+          <p id="status" class="status">Waiting for drop.</p>
+        </div>
       </section>
+      <section id="inspectorDock" class="inspector-dock card hidden" aria-live="polite">
+        <div class="inspector hidden" id="inspector"></div>
+      </section>
+      <div class="view-switch" role="tablist" aria-label="Graph view toggles">
+        <button id="defaultBtn" class="view-btn" aria-pressed="true">Default</button>
+        <button id="shapesBtn" class="view-btn" aria-pressed="false">Shapes</button>
+        <button id="heatmapBtn" class="view-btn" aria-pressed="false">Heatmaps</button>
+      </div>
+      <button id="themeBtn" class="theme-toggle" aria-label="Toggle light and dark mode">Dark</button>
       <section class="canvas-wrap">
         <div id="viz"></div>
       </section>
@@ -31,7 +45,13 @@
     <div id="dropOverlay" class="drop-overlay" aria-hidden="true">
       <div class="drop-overlay__card">Drop model file to visualize</div>
     </div>
+    <div id="processingOverlay" class="processing-overlay" aria-hidden="true">
+      <div class="processing-card">
+        <div class="processing-spinner" aria-hidden="true"></div>
+        <div id="processingText">Processing model...</div>
+      </div>
+    </div>
 
-    <script type="module" src="/static/main.js?v=70"></script>
+    <script type="module" src="/static/main.js?v=81"></script>
   </body>
 </html>

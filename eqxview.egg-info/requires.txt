@@ -1,6 +1,7 @@
 fastapi>=0.110
 uvicorn>=0.29
 equinox>=0.11
+flax>=0.8
 jax>=0.4.20
 numpy>=1.26
 cloudpickle>=3.0

@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
 eqxview/__init__.py
+eqxview/_capture.py
 eqxview/app.py
 eqxview/introspection.py
 eqxview/model_loading.py

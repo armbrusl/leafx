@@ -46,8 +46,21 @@ Supported file extensions:
 - .pickle
 - .cloudpickle
 
+Pickle-based uploads can contain either:
+- an Equinox model object, or
+- a Flax payload such as `(module, variables)` or a dict with `module` + `variables`/`params`.
+
 Recommended format right now: `.eqxbundle` containing factory metadata plus
 `eqx.tree_serialise_leaves` weights.
+
+To generate built-in example files (including Flax payloads):
+
+```bash
+python example_models.py
+```
+
+This writes Equinox bundles plus Flax `.cloudpickle` payloads (stored as
+`(module, variables)` tuples) that can be dragged into the UI.
 
 Example exporter:
 

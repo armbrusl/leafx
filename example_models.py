@@ -6,6 +6,7 @@ import jax.random as jr
 import jax.numpy as jnp
 import equinox as eqx
 import cloudpickle
+import flax.linen as flax_nn
 
 import eqxview
 from eqxview.model_loading import save_model_bundle
@@ -316,7 +317,122 @@ def export_model_bundle_zoo(output_dir: Path | None = None, seed: int = 42) -> l
     return paths
 
 
+class FlaxMLP(flax_nn.Module):
+    in_size: int
+    out_size: int
+    width: int = 64
+    depth: int = 3
+
+    @flax_nn.compact
+    def __call__(self, x):
+        x = jnp.asarray(x, dtype=jnp.float32)
+        x = jnp.reshape(x, (-1,))
+        if self.in_size > 0:
+            x = x[: self.in_size]
+            pad = self.in_size - x.shape[0]
+            if pad > 0:
+                x = jnp.pad(x, (0, pad))
+        for _ in range(max(0, self.depth - 1)):
+            x = flax_nn.Dense(self.width)(x)
+            x = jnp.tanh(x)
+        x = flax_nn.Dense(self.out_size)(x)
+        return x
+
+
+class FlaxConvClassifier(flax_nn.Module):
+    in_channels: int = 1
+    hidden: int = 16
+    out_size: int = 10
+
+    @flax_nn.compact
+    def __call__(self, x):
+        x = jnp.asarray(x, dtype=jnp.float32)
+        # Accept HxW, HxWxC, or N x H x W x C by normalizing to NHWC.
+        if x.ndim == 2:
+            x = x[None, :, :, None]
+        elif x.ndim == 3:
+            x = x[None, :, :, :]
+        elif x.ndim != 4:
+            flat = jnp.reshape(x, (-1,))
+            side = jnp.maximum(1, jnp.floor(jnp.sqrt(flat.shape[0])).astype(int))
+            trim = side * side
+            flat = flat[:trim]
+            x = jnp.reshape(flat, (1, side, side, 1))
+
+        x = flax_nn.Conv(self.hidden, kernel_size=(3, 3), padding="SAME")(x)
+        x = flax_nn.relu(x)
+        x = flax_nn.Conv(self.hidden, kernel_size=(3, 3), padding="SAME")(x)
+        x = flax_nn.relu(x)
+        x = jnp.mean(x, axis=(1, 2))
+        x = flax_nn.Dense(self.out_size)(x)
+        return x[0]
+
+
+def make_flax_mlp_payload(
+    in_size: int = 32,
+    out_size: int = 4,
+    width: int = 64,
+    depth: int = 3,
+    seed: int = 0,
+):
+    module = FlaxMLP(in_size=in_size, out_size=out_size, width=width, depth=depth)
+    variables = module.init(jr.PRNGKey(seed), jnp.zeros((in_size,), dtype=jnp.float32))
+    return module, variables
+
+
+def make_flax_conv_payload(
+    in_channels: int = 1,
+    hidden: int = 16,
+    out_size: int = 10,
+    seed: int = 0,
+):
+    module = FlaxConvClassifier(
+        in_channels=in_channels,
+        hidden=hidden,
+        out_size=out_size,
+    )
+    dummy = jnp.zeros((1, 32, 32, in_channels), dtype=jnp.float32)
+    variables = module.init(jr.PRNGKey(seed), dummy)
+    return module, variables
+
+
+def build_flax_payload_zoo(seed: int = 42) -> dict[str, tuple[object, object]]:
+    return {
+        "flax_mlp": make_flax_mlp_payload(
+            in_size=32,
+            out_size=4,
+            width=64,
+            depth=3,
+            seed=seed,
+        ),
+        "flax_conv": make_flax_conv_payload(
+            in_channels=1,
+            hidden=16,
+            out_size=10,
+            seed=seed + 1,
+        ),
+    }
+
+
+def export_flax_model_zoo(output_dir: Path | None = None, seed: int = 42) -> list[Path]:
+    """Export Flax examples as cloudpickle payloads loadable by eqxview.
+
+    Each file contains a tuple: `(module, variables)`.
+    """
+    out = output_dir or Path(__file__).parent
+    out.mkdir(parents=True, exist_ok=True)
+    payloads = build_flax_payload_zoo(seed=seed)
+    paths: list[Path] = []
+    for name, payload in payloads.items():
+        path = out / f"{name}.cloudpickle"
+        with open(path, "wb") as f:
+            cloudpickle.dump(payload, f)
+        paths.append(path)
+    return paths
+
+
 if __name__ == "__main__":
     saved_paths = export_model_bundle_zoo()
+    saved_paths += export_flax_model_zoo()
     for path in saved_paths:
         print(f"Saved {path.name} ({path.stat().st_size / 1024:.1f} KB)")

@@ -2,8 +2,15 @@ const statusEl = document.getElementById("status");
 const summaryEl = document.getElementById("summary");
 const vizEl = document.getElementById("viz");
 const dropOverlayEl = document.getElementById("dropOverlay");
+const processingOverlayEl = document.getElementById("processingOverlay");
+const processingTextEl = document.getElementById("processingText");
 const inspectorEl = document.getElementById("inspector");
+const inspectorDockEl = document.getElementById("inspectorDock");
+const infoBtn = document.getElementById("infoBtn");
+const hudDetailsEl = document.getElementById("hudDetails");
+const hudEl = document.querySelector(".hud");
 const collapseBtn = document.getElementById("collapseBtn");
+const defaultBtn = document.getElementById("defaultBtn");
 const shapesBtn = document.getElementById("shapesBtn");
 const themeBtn = document.getElementById("themeBtn");
 const heatmapBtn = document.getElementById("heatmapBtn");
@@ -17,21 +24,32 @@ let currentInputShapeValue = "";
 let currentInputDtype = "";
 let currentInputHeatmap = null;
 let currentInputFile = null;
+let currentInputFlatValues = null;
 let currentOutputShape = null;
 let currentOutputDtype = "";
 let currentOutputHeatmap = null;
+let currentOutputFlatValues = null;
 let currentOutputStats = null;
 let currentNodeActivations = {};
 let expandedHeatmaps = new Set();
 let selectiveParamHeatmaps = new Set();
+let tensorProjectionModes = new Map();
 let showShapes = false;
 let showHeatmaps = false;
+let helpOpen = false;
+let themeMode = "auto";
+
+const systemLightQuery =
+  typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? window.matchMedia("(prefers-color-scheme: light)")
+    : null;
 
 /* ── Utilities ──────────────────────────────────────────── */
 
 function setStatus(text, isError = false) {
   statusEl.textContent = text;
   statusEl.classList.toggle("error", isError);
+  if (infoBtn) infoBtn.classList.toggle("has-alert", isError && !helpOpen);
 }
 
 function formatNumber(n) {
@@ -51,6 +69,329 @@ function renderSummary(summary) {
 function shapeStr(shape) {
   if (!shape || !shape.length) return "?";
   return "[" + shape.join(", ") + "]";
+}
+
+function compactShapeStr(shape, maxChars = 16) {
+  if (!shape || !shape.length) return "?";
+  const raw = shape.join("x");
+  if (raw.length <= maxChars) return raw;
+  if (shape.length === 1) return raw.slice(0, Math.max(1, maxChars - 3)) + "...";
+  let label = `${shape.length}D ${shape.slice(0, 2).join("x")}x...x${shape.at(-1)}`;
+  if (label.length <= maxChars) return label;
+  label = `${shape.length}D ${shape[0]}x...x${shape.at(-1)}`;
+  if (label.length <= maxChars) return label;
+  return `${shape.length}D ${shape[0]}...${shape.at(-1)}`;
+}
+
+function product(values) {
+  if (!values?.length) return 1;
+  return values.reduce((acc, value) => acc * value, 1);
+}
+
+function squeezeShape(shape) {
+  if (!Array.isArray(shape) || !shape.length) return shape;
+  const squeezed = shape.filter((dim) => dim !== 1);
+  return squeezed.length ? squeezed : [1];
+}
+
+function identityAxisOrder(n) {
+  return Array.from({ length: n }, (_, idx) => idx);
+}
+
+function axisOrderKey(order) {
+  return Array.isArray(order) ? order.join(",") : "";
+}
+
+function parseAxisOrderKey(key) {
+  if (!key) return null;
+  const order = key.split(",").map((value) => Number(value));
+  return order.every((value) => Number.isInteger(value)) ? order : null;
+}
+
+function generateAxisOrders(shape) {
+  const squeezedShape = squeezeShape(shape);
+  const n = Array.isArray(squeezedShape) ? squeezedShape.length : 0;
+  if (n <= 2) return [];
+  const base = identityAxisOrder(n);
+  if (n > 4) return [base];
+  const orders = [];
+  function permute(prefix, remaining) {
+    if (!remaining.length) {
+      orders.push(prefix);
+      return;
+    }
+    for (let idx = 0; idx < remaining.length; idx++) {
+      permute([...prefix, remaining[idx]], [...remaining.slice(0, idx), ...remaining.slice(idx + 1)]);
+    }
+  }
+  permute([], base);
+  orders.sort((left, right) => {
+    const leftKey = axisOrderKey(left);
+    const rightKey = axisOrderKey(right);
+    if (leftKey === axisOrderKey(base)) return -1;
+    if (rightKey === axisOrderKey(base)) return 1;
+    return leftKey.localeCompare(rightKey);
+  });
+  return orders;
+}
+
+function getAxisOrderForTensor(tensorId, shape) {
+  const orders = generateAxisOrders(shape);
+  if (!orders.length) return null;
+  const saved = parseAxisOrderKey(tensorProjectionModes.get(tensorId));
+  if (saved) {
+    const match = orders.find((order) => axisOrderKey(order) === axisOrderKey(saved));
+    if (match) return match;
+  }
+  return orders[0];
+}
+
+function setAxisOrderForTensor(tensorId, order) {
+  if (!tensorId || !Array.isArray(order)) return;
+  tensorProjectionModes.set(tensorId, axisOrderKey(order));
+}
+
+function tensorProjection(shape, values2d = null, axisOrder = null) {
+  const squeezedShape = squeezeShape(shape);
+  if (Array.isArray(squeezedShape) && squeezedShape.length) {
+    const order = Array.isArray(axisOrder) && axisOrder.length === squeezedShape.length
+      ? axisOrder
+      : identityAxisOrder(squeezedShape.length);
+    const orderedShape = order.map((idx) => squeezedShape[idx]);
+    if (orderedShape.length === 1) {
+      return {
+        rows: 1,
+        cols: orderedShape[0],
+        rowShape: [],
+        colShape: [orderedShape[0]],
+        displayShape: squeezedShape,
+        orderedShape,
+      };
+    }
+    if (orderedShape.length === 2) {
+      return {
+        rows: orderedShape[0],
+        cols: orderedShape[1],
+        rowShape: [orderedShape[0]],
+        colShape: [orderedShape[1]],
+        displayShape: squeezedShape,
+        orderedShape,
+        projected: false,
+      };
+    }
+    const outerShape = orderedShape.slice(0, -2);
+    const innerRows = orderedShape[orderedShape.length - 2];
+    const innerCols = orderedShape[orderedShape.length - 1];
+    const outerSplit = Math.max(1, Math.ceil(outerShape.length / 2));
+    const blockRowShape = outerShape.slice(0, outerSplit);
+    const blockColShape = outerShape.slice(outerSplit);
+    const blockRows = product(blockRowShape) || 1;
+    const blockCols = product(blockColShape) || 1;
+    return {
+      rows: blockRows * innerRows,
+      cols: blockCols * innerCols,
+      rowShape: [blockRows, innerRows],
+      colShape: [blockCols, innerCols],
+      blockRowShape,
+      blockColShape,
+      blockRows,
+      blockCols,
+      innerRows,
+      innerCols,
+      displayShape: squeezedShape,
+      orderedShape,
+      axisOrder: order,
+      projected: true,
+    };
+  }
+  return {
+    rows: values2d?.length || 1,
+    cols: values2d?.[0]?.length || 1,
+    rowShape: values2d?.length ? [values2d.length] : [],
+    colShape: values2d?.[0]?.length ? [values2d[0].length] : [],
+    displayShape: values2d?.length ? [values2d.length, values2d?.[0]?.length || 1] : null,
+    projected: false,
+  };
+}
+
+function tensorProjectionLabel(shape, axisOrder = null) {
+  const squeezedShape = squeezeShape(shape);
+  if (!Array.isArray(squeezedShape) || squeezedShape.length <= 2) return null;
+  const projection = tensorProjection(squeezedShape, null, axisOrder);
+  if (!projection.projected) return null;
+  const rowBlocks = projection.blockRowShape?.length ? projection.blockRowShape.join("x") : "1";
+  const colBlocks = projection.blockColShape?.length ? projection.blockColShape.join("x") : "1";
+  return `${rowBlocks} by ${colBlocks} blocks of ${projection.innerRows}x${projection.innerCols}`;
+}
+
+function inflateTensorIndex(originalShape, squeezedIndex) {
+  if (!Array.isArray(originalShape) || !originalShape.length) return squeezedIndex;
+  const out = [];
+  let cursor = 0;
+  for (const dim of originalShape) {
+    if (dim === 1) {
+      out.push(0);
+    } else {
+      out.push(squeezedIndex[cursor] ?? 0);
+      cursor += 1;
+    }
+  }
+  return out;
+}
+
+function unflattenIndex(index, dims) {
+  if (!dims?.length) return [];
+  const out = new Array(dims.length);
+  let rest = index;
+  for (let i = dims.length - 1; i >= 0; i--) {
+    const dim = Math.max(1, dims[i]);
+    out[i] = rest % dim;
+    rest = Math.floor(rest / dim);
+  }
+  return out;
+}
+
+function projectFlatValues(shape, flatValues, axisOrder) {
+  const squeezedShape = squeezeShape(shape);
+  if (!Array.isArray(squeezedShape) || !squeezedShape.length) {
+    return [[flatValues?.[0] ?? 0]];
+  }
+  const total = product(squeezedShape);
+  if (!Array.isArray(flatValues) || flatValues.length < total) return null;
+
+  const projection = tensorProjection(shape, null, axisOrder);
+  const rank = squeezedShape.length;
+  const order = Array.isArray(axisOrder) && axisOrder.length === rank
+    ? axisOrder
+    : identityAxisOrder(rank);
+  const strides = new Array(rank);
+  let stride = 1;
+  for (let idx = rank - 1; idx >= 0; idx--) {
+    strides[idx] = stride;
+    stride *= squeezedShape[idx];
+  }
+
+  const values = Array.from({ length: projection.rows }, () => new Array(projection.cols).fill(0));
+  for (let row = 0; row < projection.rows; row++) {
+    const blockRowIndex = projection.projected ? Math.floor(row / projection.innerRows) : 0;
+    const innerRowIndex = projection.projected ? row % projection.innerRows : row;
+    const blockRowCoords = projection.projected ? unflattenIndex(blockRowIndex, projection.blockRowShape) : [];
+    for (let col = 0; col < projection.cols; col++) {
+      const blockColIndex = projection.projected ? Math.floor(col / projection.innerCols) : 0;
+      const innerColIndex = projection.projected ? col % projection.innerCols : col;
+      const blockColCoords = projection.projected ? unflattenIndex(blockColIndex, projection.blockColShape) : [];
+      const reorderedCoords = projection.projected
+        ? [...blockRowCoords, ...blockColCoords, innerRowIndex, innerColIndex]
+        : [row, col];
+      const originalCoords = new Array(rank).fill(0);
+      for (let pos = 0; pos < order.length; pos++) {
+        originalCoords[order[pos]] = reorderedCoords[pos] ?? 0;
+      }
+      let flatIndex = 0;
+      for (let idx = 0; idx < rank; idx++) {
+        flatIndex += originalCoords[idx] * strides[idx];
+      }
+      values[row][col] = flatValues[flatIndex] ?? 0;
+    }
+  }
+  return values;
+}
+
+function tensorSupportsProjectionCycling(shape, flatValues) {
+  return Array.isArray(flatValues) && generateAxisOrders(shape).length > 1;
+}
+
+function tensorAxisOrder(tensorId, shape) {
+  return getAxisOrderForTensor(tensorId, shape);
+}
+
+function tensorDisplayValues(datum) {
+  if (!datum) return null;
+  if (!tensorSupportsProjectionCycling(datum.shapeInfo?.shape, datum.flatValues)) {
+    return datum.values;
+  }
+  const axisOrder = tensorAxisOrder(datum.node?.id, datum.shapeInfo?.shape);
+  return projectFlatValues(datum.shapeInfo?.shape, datum.flatValues, axisOrder) || datum.values;
+}
+
+function cycleTensorProjection(tensorId, shape, direction = 1) {
+  const orders = generateAxisOrders(shape);
+  if (orders.length <= 1) return null;
+  const current = getAxisOrderForTensor(tensorId, shape);
+  const currentIdx = orders.findIndex((order) => axisOrderKey(order) === axisOrderKey(current));
+  const nextIdx = currentIdx < 0
+    ? 0
+    : (currentIdx + direction + orders.length) % orders.length;
+  const next = orders[nextIdx];
+  setAxisOrderForTensor(tensorId, next);
+  return next;
+}
+
+function tensorIndexLabel(shape, row, col, axisOrder = null) {
+  if (!Array.isArray(shape) || !shape.length) {
+    return row === 0 ? `[${col}]` : `[${row}, ${col}]`;
+  }
+  const squeezedShape = squeezeShape(shape);
+  if (squeezedShape.length === 1) {
+    return `[${inflateTensorIndex(shape, [col]).join(", ")}]`;
+  }
+  if (squeezedShape.length === 2) {
+    return `[${inflateTensorIndex(shape, [row, col]).join(", ")}]`;
+  }
+  const projection = tensorProjection(shape, null, axisOrder);
+  const blockRowIndex = Math.floor(row / projection.innerRows);
+  const innerRowIndex = row % projection.innerRows;
+  const blockColIndex = Math.floor(col / projection.innerCols);
+  const innerColIndex = col % projection.innerCols;
+  const squeezedIndex = [
+    ...unflattenIndex(blockRowIndex, projection.blockRowShape),
+    ...unflattenIndex(blockColIndex, projection.blockColShape),
+    innerRowIndex,
+    innerColIndex,
+  ];
+  const fullIndex = inflateTensorIndex(shape, squeezedIndex);
+  return `[${fullIndex.join(", ")}]`;
+}
+
+function projectionGuideLines(shape, values2d = null, axisOrder = null) {
+  const projection = tensorProjection(shape, values2d, axisOrder);
+  if (!projection.projected || projection.blockRows <= 1 && projection.blockCols <= 1) {
+    return null;
+  }
+  const rowLines = [];
+  const colLines = [];
+  for (let block = 1; block < projection.blockRows; block++) {
+    rowLines.push(block * projection.innerRows);
+  }
+  for (let block = 1; block < projection.blockCols; block++) {
+    colLines.push(block * projection.innerCols);
+  }
+  return {
+    rowLines,
+    colLines,
+    label: tensorProjectionLabel(shape, axisOrder),
+  };
+}
+
+function drawProjectionGuides(ctx, shape, values2d, cellW = 1, cellH = 1, axisOrder = null) {
+  const guides = projectionGuideLines(shape, values2d, axisOrder);
+  if (!guides) return;
+  const rows = values2d?.length || 0;
+  const cols = values2d?.[0]?.length || 0;
+  if (!rows || !cols) return;
+
+  ctx.save();
+  ctx.fillStyle = "rgba(0, 0, 0, 0.95)";
+
+  for (const rowLine of guides.rowLines) {
+    const y = Math.max(0, Math.round(rowLine * cellH) - 1);
+    ctx.fillRect(0, y, cols * cellW, 1);
+  }
+  for (const colLine of guides.colLines) {
+    const x = Math.max(0, Math.round(colLine * cellW) - 1);
+    ctx.fillRect(x, 0, 1, rows * cellH);
+  }
+  ctx.restore();
 }
 
 function bytesStr(count) {
@@ -258,6 +599,7 @@ async function loadInputFromNpy(file) {
 
   currentInputShapeValue = hdr.shape.join(", ");
   currentInputDtype = npyDescrToDtype(hdr.descr);
+  currentInputFlatValues = vals;
   currentInputHeatmap = downsample2d(hm, 64);
   currentInputFile = file;
 
@@ -278,6 +620,7 @@ function clearCurrentOutput() {
   currentOutputShape = null;
   currentOutputDtype = "";
   currentOutputHeatmap = null;
+  currentOutputFlatValues = null;
   currentOutputStats = null;
   currentNodeActivations = {};
   expandedHeatmaps.delete("__OUTPUT__");
@@ -307,6 +650,7 @@ async function runCurrentModelWithInput() {
     currentOutputShape = Array.isArray(data.shape) ? data.shape : null;
     currentOutputDtype = data.dtype || "";
     currentOutputHeatmap = Array.isArray(data.heatmap) ? data.heatmap : null;
+    currentOutputFlatValues = Array.isArray(data.flat_values) ? data.flat_values : null;
     currentOutputStats = data.stats || null;
     currentNodeActivations = data.activations && typeof data.activations === "object"
       ? data.activations
@@ -564,17 +908,44 @@ function graphFromTree(tree) {
 function clearViz() { vizEl.innerHTML = ""; }
 
 function hideInspector() {
+  if (inspectorDockEl) inspectorDockEl.classList.add("hidden");
   inspectorEl.classList.add("hidden");
   inspectorEl.innerHTML = "";
 }
 
 function showInspector(title, rows) {
+  if (inspectorDockEl) inspectorDockEl.classList.remove("hidden");
   inspectorEl.classList.remove("hidden");
   inspectorEl.innerHTML = [
     `<div class="title">${title}</div>`,
     ...rows.map((r) => `<div class="row"><span class="key">${r.key}:</span> ${r.value}</div>`),
   ].join("");
 }
+
+function updateInspectorDockPosition() {
+  if (!inspectorDockEl || !hudEl) return;
+  const top = hudEl.offsetTop + hudEl.offsetHeight + 8;
+  inspectorDockEl.style.top = `${top}px`;
+}
+
+function setHelpOpen(open) {
+  helpOpen = !!open;
+  if (hudDetailsEl) hudDetailsEl.classList.toggle("hidden", !helpOpen);
+  if (infoBtn) {
+    infoBtn.classList.toggle("is-active", helpOpen);
+    infoBtn.classList.toggle("has-alert", false);
+    infoBtn.setAttribute("aria-expanded", helpOpen ? "true" : "false");
+  }
+  updateInspectorDockPosition();
+}
+
+if (infoBtn) {
+  infoBtn.addEventListener("click", () => setHelpOpen(!helpOpen));
+}
+
+setHelpOpen(false);
+window.addEventListener("resize", updateInspectorDockPosition);
+updateInspectorDockPosition();
 
 function compactEdgeLabel(label) {
   if (!label) return "";
@@ -623,20 +994,17 @@ function resolveHeatRange(values2d, rangeOverride = null) {
 }
 
 function tensorDisplayDims(shape, values2d) {
-  if (Array.isArray(shape) && shape.length) {
-    if (shape.length === 1) return { rows: 1, cols: shape[0] };
+  if (values2d?.length) {
     return {
-      rows: shape[shape.length - 2],
-      cols: shape[shape.length - 1],
+      rows: values2d.length,
+      cols: values2d[0]?.length || 1,
     };
   }
-  return {
-    rows: values2d?.length || 1,
-    cols: values2d?.[0]?.length || 1,
-  };
+  const projection = tensorProjection(shape, values2d);
+  return { rows: projection.rows, cols: projection.cols };
 }
 
-function drawHeatmap(canvas, values2d, rangeOverride = null) {
+function drawHeatmap(canvas, values2d, rangeOverride = null, shape = null, axisOrder = null) {
   if (!values2d || !values2d.length) return;
   const rows = values2d.length;
   const cols = values2d[0].length;
@@ -658,6 +1026,7 @@ function drawHeatmap(canvas, values2d, rangeOverride = null) {
       img.data[i + 3] = 255;
     }
   ctx.putImageData(img, 0, 0);
+  drawProjectionGuides(ctx, shape, values2d, 1, 1, axisOrder);
 }
 
 function heatmapBaseCellPx(rows, cols) {
@@ -689,11 +1058,14 @@ function heatmapThumbSize(values2d, shape = null) {
 
   const rawW = cols * ppc;
   const rawH = rows * ppc;
-  // Downscale uniformly if either dimension exceeds the cap.
-  const fit = Math.min(1, maxW / rawW, maxH / rawH);
+  // Scale uniformly: fit within caps, then ensure minimums — always preserving
+  // the data aspect ratio so projections with extreme shapes aren't distorted.
+  const fitDown = Math.min(1, maxW / rawW, maxH / rawH);
+  const fitUp = Math.max(1, 12 / (rawW * fitDown), 12 / (rawH * fitDown));
+  const scale = fitDown * fitUp;
   return {
-    w: Math.max(24, Math.round(rawW * fit)),
-    h: Math.max(12, Math.round(rawH * fit)),
+    w: Math.max(12, Math.round(rawW * scale)),
+    h: Math.max(12, Math.round(rawH * scale)),
   };
 }
 
@@ -703,6 +1075,11 @@ function scaleThumbSize(thumb, factor = 1) {
     w: Math.min(920, Math.max(24, Math.round(thumb.w * factor))),
     h: Math.min(720, Math.max(4, Math.round(thumb.h * factor))),
   };
+}
+
+function tensorThumbSize(datum) {
+  if (!datum) return null;
+  return heatmapThumbSize(tensorDisplayValues(datum), datum.shapeInfo?.shape);
 }
 
 function heatColorRGB(v, vmin, vmax) {
@@ -736,61 +1113,30 @@ function formatHeatValue(v) {
   return v.toFixed(4);
 }
 
-function drawZoomableHeatmap(canvas, values2d, zoom = 1, rangeOverride = null) {
-  if (!values2d || !values2d.length) return;
-  const rows = values2d.length;
-  const cols = values2d[0].length;
-
-  const { vmin, vmax } = resolveHeatRange(values2d, rangeOverride);
-
-  const baseCell = heatmapBaseCellPx(rows, cols);
-  const cell = Math.max(1, Math.floor(baseCell * zoom));
-
-  const w = cols * cell;
-  const h = rows * cell;
-  canvas.width = w;
-  canvas.height = h;
-  canvas.style.width = `${w}px`;
-  canvas.style.height = `${h}px`;
-
-  const ctx = canvas.getContext("2d");
-  ctx.clearRect(0, 0, w, h);
-
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const v = values2d[r][c];
-      const col = heatColorRGB(v, vmin, vmax);
-      ctx.fillStyle = `rgb(${col.r},${col.g},${col.b})`;
-      ctx.fillRect(c * cell, r * cell, cell, cell);
-    }
-  }
-
-  // Show numeric value once each cell is large enough.
-  if (cell >= 18) {
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.font = `${Math.max(10, Math.floor(cell * 0.33))}px "IBM Plex Mono", monospace`;
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const v = values2d[r][c];
-        const col = heatColorRGB(v, vmin, vmax);
-        ctx.fillStyle = col.luminance > 0.72 ? "#111" : "#fff";
-        ctx.fillText(formatHeatValue(v), c * cell + cell / 2, r * cell + cell / 2);
-      }
-    }
-  }
-}
-
 function colorForGroup(groupId) {
   const text = String(groupId || "");
   let hash = 0;
   for (let i = 0; i < text.length; i++) {
     hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
   }
-  const hue = hash % 360;
+  const isLight = document.documentElement.classList.contains("light");
+
+  if (isLight) {
+    const hue = hash % 360;
+    return {
+      stroke: `hsl(${hue} 44% 48% / 0.7)`,
+      fill: `hsl(${hue} 36% 58% / 0.045)`,
+    };
+  }
+
+  // Curated high-contrast hues for dark backgrounds.
+  const darkHues = [
+    10, 28, 46, 68, 92, 118, 145, 172, 198, 224, 248, 272, 298, 324, 346,
+  ];
+  const hue = darkHues[hash % darkHues.length];
   return {
-    stroke: `hsl(${hue} 38% 60% / 0.55)`,
-    fill: `hsl(${hue} 32% 55% / 0.035)`,
+    stroke: `hsl(${hue} 82% 72% / 0.96)`,
+    fill: `hsl(${hue} 78% 60% / 0.14)`,
   };
 }
 
@@ -912,6 +1258,8 @@ async function renderOperationGraph(rawGraph) {
     updateZoomAwareOverlays(event.transform.k);
   });
   svg.call(zoomBehavior);
+  // Reserve double-click for app gestures (expand/collapse all), not zoom.
+  svg.on("dblclick.zoom", null);
   if (currentTransform) svg.call(zoomBehavior.transform, currentTransform);
 
   const opNodeW = 78;
@@ -931,16 +1279,41 @@ async function renderOperationGraph(rawGraph) {
     return Math.max(16, Math.min(72, Math.round(base * 0.18)));
   }
 
+  const inputShape = parseInputShape();
+  const inputDatum = {
+    node: { id: "__INPUT__", label: "input" },
+    shapeInfo: inputShape
+      ? {
+        shape: inputShape,
+        dtype: currentInputDtype || "float32",
+        bytes: inputShape.reduce((a, b) => a * b, 1) * itemsizeForDtype(currentInputDtype || "float32"),
+      }
+      : null,
+    values: currentInputHeatmap,
+    flatValues: Array.isArray(currentInputFlatValues) ? currentInputFlatValues : null,
+  };
   const inputThumbBase = (showHeatmaps && currentInputHeatmap)
-    ? heatmapThumbSize(currentInputHeatmap, parseInputShape())
+    ? tensorThumbSize(inputDatum)
     : null;
   const inputThumb = expandedHeatmaps.has("__INPUT__")
     ? scaleThumbSize(inputThumbBase, 2.5)
     : inputThumbBase;
   const inputNodeW = inputThumb ? inputThumb.w : 150;
   const inputNodeH = inputThumb ? inputThumb.h : 40;
+  const outputDatum = {
+    node: { id: "__OUTPUT__", label: "output", type: "output" },
+    shapeInfo: currentOutputShape
+      ? {
+        shape: currentOutputShape,
+        dtype: currentOutputDtype || null,
+        bytes: null,
+      }
+      : null,
+    values: currentOutputHeatmap,
+    flatValues: Array.isArray(currentOutputFlatValues) ? currentOutputFlatValues : null,
+  };
   const outputThumbBase = (showHeatmaps && currentOutputHeatmap)
-    ? heatmapThumbSize(currentOutputHeatmap, currentOutputShape)
+    ? tensorThumbSize(outputDatum)
     : null;
   const outputThumb = expandedHeatmaps.has("__OUTPUT__")
     ? scaleThumbSize(outputThumbBase, 2.5)
@@ -950,14 +1323,28 @@ async function renderOperationGraph(rawGraph) {
 
   const renderSizeById = new Map();
   const elkChildren = graph.nodes.map((n) => {
-    const hasActHeatmap = showHeatmaps && activationForNode(n)?.heatmap;
+    const activation = activationForNode(n);
+    const activationDatum = activation?.heatmap?.length
+      ? {
+        node: { id: n.id, label: n.label, type: n.type },
+        shapeInfo: {
+          shape: activation.shape,
+          dtype: activation.dtype,
+          bytes: activation.bytes,
+        },
+        values: activation.heatmap,
+        flatValues: Array.isArray(activation.flat_values) ? activation.flat_values : null,
+      }
+      : null;
+    const activationThumb = showHeatmaps ? tensorThumbSize(activationDatum) : null;
+    const hasActHeatmap = !!activationThumb;
     const w =
       n.type === "input"
         ? inputNodeW
         : n.type === "output"
           ? outputNodeW
           : hasActHeatmap
-            ? heatmapThumbSize(activationForNode(n).heatmap, activationForNode(n).shape)?.w || opNodeW
+            ? activationThumb?.w || opNodeW
           : n._collapsed
             ? collapsedNodeW(n)
             : opNodeW;
@@ -967,7 +1354,7 @@ async function renderOperationGraph(rawGraph) {
         : n.type === "output"
           ? outputNodeH
           : hasActHeatmap
-            ? heatmapThumbSize(activationForNode(n).heatmap, activationForNode(n).shape)?.h || opNodeH
+            ? activationThumb?.h || opNodeH
           : n._collapsed
             ? layerNodeH
             : opNodeH;
@@ -992,7 +1379,18 @@ async function renderOperationGraph(rawGraph) {
     if (!edge.source) {
       const synthId = `param-src-${idx}`;
       if (paramHeatmapVisible(synthId) && edge.values && edge.values.length) {
-        const baseThumb = heatmapThumbSize(edge.values, edge.shape);
+        const baseThumb = tensorThumbSize({
+          node: { id: synthId, label: compactEdgeLabel(edge.label), type: "parameter" },
+          shapeInfo: edge.shape
+            ? {
+              shape: edge.shape,
+              dtype: edge.dtype,
+              bytes: edge.shape.reduce((a, b) => a * b, 1) * itemsizeForDtype(edge.dtype),
+            }
+            : null,
+          values: edge.values || null,
+          flatValues: Array.isArray(edge.flat_values) ? edge.flat_values : null,
+        });
         const thumb = expandedHeatmaps.has(synthId) ? scaleThumbSize(baseThumb, 2.5) : baseThumb;
         if (thumb) {
           const routePad = heatmapRoutePad(thumb.w, thumb.h);
@@ -1079,6 +1477,7 @@ async function renderOperationGraph(rawGraph) {
         isParam: true,
         shapeInfo: si || (edge.shape ? { shape: edge.shape, dtype: edge.dtype, bytes: (edge.shape.reduce((a,b)=>a*b,1)) * itemsizeForDtype(edge.dtype) } : null),
         values: edge.values || null,
+        flatValues: Array.isArray(edge.flat_values) ? edge.flat_values : null,
       };
       nodePos.set(synthId, info);
       paramNodesData.push(info);
@@ -1198,21 +1597,25 @@ async function renderOperationGraph(rawGraph) {
   function nodeLabel(d) {
     if (!showShapes) return d.node.label;
     const s = nodeShapes.get(d.node.id);
-    return s ? shapeStr(s) : d.node.label;
+    return s ? compactShapeStr(s) : d.node.label;
   }
 
   function paramLabel(d) {
     if (!showShapes) return d.node.label;
-    return d.shapeInfo?.shape ? shapeStr(d.shapeInfo.shape) : d.node.label;
+    return d.shapeInfo?.shape ? compactShapeStr(d.shapeInfo.shape) : d.node.label;
   }
 
   function parameterInspectorRows(d, extraRows = []) {
     const rows = [{ key: "name", value: d.node.label || "-" }];
     if (d.shapeInfo?.shape) rows.push({ key: "shape", value: shapeStr(d.shapeInfo.shape) });
+    const axisOrder = tensorAxisOrder(d.node?.id, d.shapeInfo?.shape);
+    const projection = tensorProjectionLabel(d.shapeInfo?.shape, axisOrder);
+    if (projection) rows.push({ key: "view", value: projection });
     if (d.shapeInfo?.dtype) rows.push({ key: "dtype", value: d.shapeInfo.dtype });
     if (d.shapeInfo?.bytes != null) rows.push({ key: "size", value: bytesStr(d.shapeInfo.bytes) });
-    if (paramHeatmapVisible(d.node.id) && d.values) {
-      const st = valuesStats(d.values);
+    const visibleValues = tensorDisplayValues(d);
+    if (paramHeatmapVisible(d.node.id) && visibleValues) {
+      const st = valuesStats(visibleValues);
       if (st) {
         rows.push({ key: "min", value: st.min.toFixed(4) });
         rows.push({ key: "max", value: st.max.toFixed(4) });
@@ -1248,6 +1651,8 @@ async function renderOperationGraph(rawGraph) {
     if (d.node.capture_name) rows.push({ key: "capture", value: d.node.capture_name });
     rows.push({ key: "group", value: d.node.group || "-" });
     if (activation?.shape) rows.push({ key: "shape", value: shapeStr(activation.shape) });
+    const projection = tensorProjectionLabel(activation?.shape);
+    if (projection) rows.push({ key: "view", value: projection });
     if (activation?.dtype) rows.push({ key: "dtype", value: activation.dtype });
     if (activation?.bytes != null) rows.push({ key: "size", value: bytesStr(activation.bytes) });
     if (showHeatmaps && activation?.stats) {
@@ -1256,7 +1661,7 @@ async function renderOperationGraph(rawGraph) {
       rows.push({ key: "mean", value: activation.stats.mean.toFixed(4) });
       rows.push({ key: "std", value: activation.stats.std.toFixed(4) });
     }
-    showInspector(d.node._collapsed ? "Layer (left-click to expand, right-click to collapse)" : "Node", rows);
+    showInspector(d.node._collapsed ? "Layer" : "Node", rows);
   }).on("mouseleave", () => hideInspector());
 
   function expandOneLevel(d) {
@@ -1319,8 +1724,7 @@ async function renderOperationGraph(rawGraph) {
   }
 
   gOp.on("click", (event, d) => {
-    // Left click expands collapsed nodes; for visible activation heatmaps,
-    // it toggles expanded view even if the inner hit-rect misses the event.
+    // Left click expands collapsed nodes. It does not resize heatmaps.
     if (event.button !== 0) return;
     if (d.node._collapsed) {
       const childPrefixes = d.node._collapsedPrefix
@@ -1333,9 +1737,11 @@ async function renderOperationGraph(rawGraph) {
     }
     const activation = activationForNode(d.node);
     if (showHeatmaps && activation?.heatmap?.length) {
-      if (expandedHeatmaps.has(d.node.id)) expandedHeatmaps.delete(d.node.id);
-      else expandedHeatmaps.add(d.node.id);
-      renderOperationGraph(currentGraph);
+      const flatVals = Array.isArray(activation.flat_values) ? activation.flat_values : null;
+      if (tensorSupportsProjectionCycling(activation.shape, flatVals)) {
+        cycleTensorProjection(d.node.id, activation.shape, 1);
+        renderOperationGraph(currentGraph);
+      }
       return;
     }
 
@@ -1347,6 +1753,15 @@ async function renderOperationGraph(rawGraph) {
   gOp.on("contextmenu", (event, d) => {
     // Right click collapses this group (or parent level for collapsed placeholders).
     event.preventDefault();
+    const activation = activationForNode(d.node);
+    if (showHeatmaps && activation?.heatmap?.length) {
+      const flatVals = Array.isArray(activation.flat_values) ? activation.flat_values : null;
+      if (tensorSupportsProjectionCycling(activation.shape, flatVals)) {
+        cycleTensorProjection(d.node.id, activation.shape, -1);
+        renderOperationGraph(currentGraph);
+        return;
+      }
+    }
     collapseGroup(d);
   });
 
@@ -1372,16 +1787,6 @@ async function renderOperationGraph(rawGraph) {
         .attr("clip-path", `url(#${clipId})`)
         .style("pointer-events", "none");
 
-      const cvs = fo.append("xhtml:canvas")
-        .attr("width", d.w)
-        .attr("height", d.h)
-        .style("width", d.w + "px")
-        .style("height", d.h + "px")
-        .style("display", "block")
-        .style("border-radius", "0px")
-        .style("image-rendering", "pixelated");
-      drawHeatmap(cvs.node(), activation.heatmap, globalHeatRange);
-
       const activationDatum = {
         node: { id: d.node.id, label: d.node.label, type: d.node.type },
         shapeInfo: {
@@ -1390,7 +1795,20 @@ async function renderOperationGraph(rawGraph) {
           bytes: activation.bytes,
         },
         values: activation.heatmap,
+        flatValues: Array.isArray(activation.flat_values) ? activation.flat_values : null,
       };
+      const activationAxisOrder = tensorAxisOrder(activationDatum.node.id, activationDatum.shapeInfo.shape);
+      const activationValues = tensorDisplayValues(activationDatum);
+
+      const cvs = fo.append("xhtml:canvas")
+        .attr("width", d.w)
+        .attr("height", d.h)
+        .style("width", d.w + "px")
+        .style("height", d.h + "px")
+        .style("display", "block")
+        .style("border-radius", "0px")
+        .style("image-rendering", "pixelated");
+      drawHeatmap(cvs.node(), activationValues, globalHeatRange, activation.shape, activationAxisOrder);
 
       const hitRect = g.append("rect")
         .attr("x", -d.w / 2)
@@ -1401,40 +1819,21 @@ async function renderOperationGraph(rawGraph) {
         .style("cursor", "pointer");
 
       hitRect.on("mousemove", function (event) {
-        const rows = activation.heatmap.length;
-        const cols = activation.heatmap[0]?.length || 1;
+        const rows = activationValues.length;
+        const cols = activationValues[0]?.length || 1;
         const [px, py] = d3.pointer(event, this);
         const col = Math.max(0, Math.min(cols - 1, Math.floor((px + d.w / 2) / d.w * cols)));
         const row = Math.max(0, Math.min(rows - 1, Math.floor((py + d.h / 2) / d.h * rows)));
-        const value = activation.heatmap[row]?.[col];
-        const indexLabel = rows === 1 ? `[${col}]` : `[${row}, ${col}]`;
+        const value = activationValues[row]?.[col];
+        const indexLabel = tensorIndexLabel(activation.shape, row, col, activationAxisOrder);
         const rowsOut = parameterInspectorRows(activationDatum, [
           { key: "current", value: value != null ? formatHeatValue(value) : "-" },
           { key: "index", value: indexLabel },
           { key: "path", value: d.node.path || "-" },
         ]);
-        if (activation.stats) {
-          rowsOut.push(
-            { key: "min", value: activation.stats.min.toFixed(4) },
-            { key: "max", value: activation.stats.max.toFixed(4) },
-            { key: "mean", value: activation.stats.mean.toFixed(4) },
-            { key: "std", value: activation.stats.std.toFixed(4) },
-          );
-        }
         showInspector("Node", rowsOut);
       });
 
-      hitRect.on("click", (event) => {
-        event.stopPropagation();
-        if (expandedHeatmaps.has(d.node.id)) expandedHeatmaps.delete(d.node.id);
-        else expandedHeatmaps.add(d.node.id);
-        renderOperationGraph(currentGraph);
-      });
-
-      hitRect.on("dblclick", (event) => {
-        event.stopPropagation();
-        openHeatmapPopup(activationDatum, globalHeatRange);
-      });
       return;
     }
 
@@ -1460,30 +1859,39 @@ async function renderOperationGraph(rawGraph) {
     showInspector("Parameter", parameterInspectorRows(d));
   }).on("mouseleave", () => hideInspector());
 
-  // Clicking a parameter node toggles its heatmap visibility (selective mode),
-  // or toggles expanded/collapsed if already visible.
+  // Clicking a parameter node toggles its heatmap visibility (selective mode).
+  // Visible heatmaps with cycling support cycle the projection on click.
   gParam.on("click", (event, d) => {
     if (event.button !== 0) return;
     if (!d.values?.length) return;
     if (paramHeatmapVisible(d.node.id)) {
-      // Already visible: toggle expanded size
-      if (expandedHeatmaps.has(d.node.id)) expandedHeatmaps.delete(d.node.id);
-      else expandedHeatmaps.add(d.node.id);
-    } else {
-      // Not visible: make it visible via selective set
-      selectiveParamHeatmaps.add(d.node.id);
+      if (tensorSupportsProjectionCycling(d.shapeInfo?.shape, d.flatValues)) {
+        cycleTensorProjection(d.node.id, d.shapeInfo?.shape, 1);
+        renderOperationGraph(currentGraph);
+      }
+      return;
     }
+    selectiveParamHeatmaps.add(d.node.id);
     renderOperationGraph(currentGraph);
   });
 
   // Right-click hides a selectively-visible parameter heatmap.
   gParam.on("contextmenu", (event, d) => {
     if (!d.values?.length) return;
-    if (selectiveParamHeatmaps.has(d.node.id)) {
-      event.preventDefault();
-      selectiveParamHeatmaps.delete(d.node.id);
-      expandedHeatmaps.delete(d.node.id);
-      renderOperationGraph(currentGraph);
+    if (paramHeatmapVisible(d.node.id)) {
+      if (tensorSupportsProjectionCycling(d.shapeInfo?.shape, d.flatValues) && !event.shiftKey) {
+        event.preventDefault();
+        cycleTensorProjection(d.node.id, d.shapeInfo?.shape, -1);
+        renderOperationGraph(currentGraph);
+        return;
+      }
+      if (selectiveParamHeatmaps.has(d.node.id)) {
+        event.preventDefault();
+        selectiveParamHeatmaps.delete(d.node.id);
+        expandedHeatmaps.delete(d.node.id);
+        renderOperationGraph(currentGraph);
+      }
+      return;
     }
   });
 
@@ -1514,16 +1922,15 @@ async function renderOperationGraph(rawGraph) {
         .attr("clip-path", `url(#${clipId})`)
         .style("pointer-events", "none");
 
+      const displayedValues = tensorDisplayValues(d);
+      const axisOrder = tensorAxisOrder(d.node.id, d.shapeInfo?.shape);
       const cvs = fo.append("xhtml:canvas")
         .attr("width", d.w).attr("height", d.h)
         .style("width", d.w + "px").style("height", d.h + "px")
         .style("display", "block")
         .style("border-radius", `${cornerR}px`)
         .style("image-rendering", "pixelated");
-      drawHeatmap(cvs.node(), d.values, globalHeatRange);
-
-      const rows = d.values.length;
-      const cols = d.values[0]?.length || 1;
+      drawHeatmap(cvs.node(), displayedValues, globalHeatRange, d.shapeInfo?.shape, axisOrder);
 
       // Invisible hit area – use .style() so CSS .param-node rect can't override
       const hitRect = g.append("rect")
@@ -1533,45 +1940,18 @@ async function renderOperationGraph(rawGraph) {
         .style("cursor", "pointer");
 
       hitRect.on("mousemove", function (event) {
-        if (!d.values?.length) return;
-        const rows = d.values.length;
-        const cols = d.values[0]?.length || 1;
+        if (!displayedValues?.length) return;
+        const rows = displayedValues.length;
+        const cols = displayedValues[0]?.length || 1;
         const [px, py] = d3.pointer(event, this);
         const col = Math.max(0, Math.min(cols - 1, Math.floor((px + d.w / 2) / d.w * cols)));
         const row = Math.max(0, Math.min(rows - 1, Math.floor((py + d.h / 2) / d.h * rows)));
-        const value = d.values[row]?.[col];
-        const indexLabel = rows === 1 ? `[${col}]` : `[${row}, ${col}]`;
+        const value = displayedValues[row]?.[col];
+        const indexLabel = tensorIndexLabel(d.shapeInfo?.shape, row, col, axisOrder);
         showInspector("Parameter", parameterInspectorRows(d, [
           { key: "current", value: value != null ? formatHeatValue(value) : "-" },
           { key: "index", value: indexLabel },
         ]));
-      });
-
-      hitRect.on("click", (event) => {
-        event.stopPropagation();
-        if (!d.values?.length) return;
-        if (paramHeatmapVisible(d.node.id)) {
-          if (expandedHeatmaps.has(d.node.id)) expandedHeatmaps.delete(d.node.id);
-          else expandedHeatmaps.add(d.node.id);
-        } else {
-          selectiveParamHeatmaps.add(d.node.id);
-        }
-        renderOperationGraph(currentGraph);
-      });
-
-      hitRect.on("contextmenu", (event) => {
-        if (selectiveParamHeatmaps.has(d.node.id)) {
-          event.preventDefault();
-          event.stopPropagation();
-          selectiveParamHeatmaps.delete(d.node.id);
-          expandedHeatmaps.delete(d.node.id);
-          renderOperationGraph(currentGraph);
-        }
-      });
-
-      hitRect.on("dblclick", (event) => {
-        event.stopPropagation();
-        openHeatmapPopup(d, globalHeatRange);
       });
     });
 
@@ -1611,27 +1991,16 @@ async function renderOperationGraph(rawGraph) {
           .attr("clip-path", `url(#${clipId})`)
           .style("pointer-events", "none");
 
+        const inputAxisOrder = tensorAxisOrder(inputDatum.node.id, inputDatum.shapeInfo?.shape);
+        const inputValues = tensorDisplayValues(inputDatum);
+
         const cvsHm = foHm.append("xhtml:canvas")
           .attr("width", hmW).attr("height", hmH)
           .style("width", hmW + "px").style("height", hmH + "px")
           .style("display", "block")
           .style("border-radius", "0px")
           .style("image-rendering", "pixelated");
-        drawHeatmap(cvsHm.node(), currentInputHeatmap, globalHeatRange);
-
-        const inputShape = parseInputShape();
-        const inputShapeInfo = inputShape
-          ? {
-            shape: inputShape,
-            dtype: currentInputDtype || "float32",
-            bytes: inputShape.reduce((a, b) => a * b, 1) * itemsizeForDtype(currentInputDtype || "float32"),
-          }
-          : null;
-        const inputDatum = {
-          node: { label: "input" },
-          shapeInfo: inputShapeInfo,
-          values: currentInputHeatmap,
-        };
+        drawHeatmap(cvsHm.node(), inputValues, globalHeatRange, inputDatum.shapeInfo?.shape, inputAxisOrder);
 
         const hitRect = g.append("rect")
           .attr("x", -d.w / 2).attr("y", -d.h / 2)
@@ -1640,29 +2009,31 @@ async function renderOperationGraph(rawGraph) {
           .style("cursor", "pointer");
 
         hitRect.on("mousemove", function (event) {
-          const rows = currentInputHeatmap.length;
-          const cols = currentInputHeatmap[0]?.length || 1;
+          const rows = inputValues.length;
+          const cols = inputValues[0]?.length || 1;
           const [px, py] = d3.pointer(event, this);
           const col = Math.max(0, Math.min(cols - 1, Math.floor((px + d.w / 2) / d.w * cols)));
           const row = Math.max(0, Math.min(rows - 1, Math.floor((py + d.h / 2) / d.h * rows)));
-          const value = currentInputHeatmap[row]?.[col];
-          const indexLabel = rows === 1 ? `[${col}]` : `[${row}, ${col}]`;
+          const value = inputValues[row]?.[col];
+          const indexLabel = tensorIndexLabel(inputDatum.shapeInfo?.shape, row, col, inputAxisOrder);
           showInspector("Input", parameterInspectorRows(inputDatum, [
             { key: "current", value: value != null ? formatHeatValue(value) : "-" },
             { key: "index", value: indexLabel },
           ]));
         });
 
-        hitRect.on("click", (event) => {
-          event.stopPropagation();
-          if (expandedHeatmaps.has("__INPUT__")) expandedHeatmaps.delete("__INPUT__");
-          else expandedHeatmaps.add("__INPUT__");
+        g.on("click", function (event) {
+          if (event.button !== 0) return;
+          if (!tensorSupportsProjectionCycling(inputDatum.shapeInfo?.shape, inputDatum.flatValues)) return;
+          cycleTensorProjection(inputDatum.node.id, inputDatum.shapeInfo?.shape, 1);
           renderOperationGraph(currentGraph);
         });
 
-        hitRect.on("dblclick", (event) => {
-          event.stopPropagation();
-          openHeatmapPopup(inputDatum, globalHeatRange);
+        g.on("contextmenu", function (event) {
+          if (!tensorSupportsProjectionCycling(inputDatum.shapeInfo?.shape, inputDatum.flatValues)) return;
+          event.preventDefault();
+          cycleTensorProjection(inputDatum.node.id, inputDatum.shapeInfo?.shape, -1);
+          renderOperationGraph(currentGraph);
         });
 
         g.on("mouseenter", () => {
@@ -1686,6 +2057,7 @@ async function renderOperationGraph(rawGraph) {
           .attr("width", foW).attr("height", foH);
         const inp = fo.append("xhtml:input")
           .attr("type", "text")
+          .attr("name", "input-shape")
           .attr("class", "graph-input-shape")
           .attr("placeholder", "1, 128")
           .attr("spellcheck", "false")
@@ -1773,23 +2145,25 @@ async function renderOperationGraph(rawGraph) {
           .attr("clip-path", `url(#${clipId})`)
           .style("pointer-events", "none");
 
+        const outputRenderDatum = {
+          ...outputDatum,
+          shapeInfo: {
+            ...(outputDatum.shapeInfo || {}),
+            shape: outputShape,
+            dtype: currentOutputDtype || outSI?.dtype || null,
+            bytes: null,
+          },
+        };
+        const outputAxisOrder = tensorAxisOrder(outputRenderDatum.node.id, outputRenderDatum.shapeInfo?.shape);
+        const outputValues = tensorDisplayValues(outputRenderDatum);
+
         const cvsHm = foHm.append("xhtml:canvas")
           .attr("width", hmW).attr("height", hmH)
           .style("width", hmW + "px").style("height", hmH + "px")
           .style("display", "block")
           .style("border-radius", "0px")
           .style("image-rendering", "pixelated");
-        drawHeatmap(cvsHm.node(), currentOutputHeatmap, globalHeatRange);
-
-        const outputDatum = {
-          node: { id: "__OUTPUT__", label: "output", type: "output" },
-          shapeInfo: {
-            shape: outputShape,
-            dtype: currentOutputDtype || outSI?.dtype || null,
-            bytes: null,
-          },
-          values: currentOutputHeatmap,
-        };
+        drawHeatmap(cvsHm.node(), outputValues, globalHeatRange, outputShape, outputAxisOrder);
 
         const hitRect = g.append("rect")
           .attr("x", -d.w / 2).attr("y", -d.h / 2)
@@ -1798,14 +2172,14 @@ async function renderOperationGraph(rawGraph) {
           .style("cursor", "pointer");
 
         hitRect.on("mousemove", function (event) {
-          const rows = currentOutputHeatmap.length;
-          const cols = currentOutputHeatmap[0]?.length || 1;
+          const rows = outputValues.length;
+          const cols = outputValues[0]?.length || 1;
           const [px, py] = d3.pointer(event, this);
           const col = Math.max(0, Math.min(cols - 1, Math.floor((px + d.w / 2) / d.w * cols)));
           const row = Math.max(0, Math.min(rows - 1, Math.floor((py + d.h / 2) / d.h * rows)));
-          const value = currentOutputHeatmap[row]?.[col];
-          const indexLabel = rows === 1 ? `[${col}]` : `[${row}, ${col}]`;
-          const rowsOut = parameterInspectorRows(outputDatum, [
+          const value = outputValues[row]?.[col];
+          const indexLabel = tensorIndexLabel(outputShape, row, col, outputAxisOrder);
+          const rowsOut = parameterInspectorRows(outputRenderDatum, [
             { key: "current", value: value != null ? formatHeatValue(value) : "-" },
             { key: "index", value: indexLabel },
           ]);
@@ -1820,20 +2194,22 @@ async function renderOperationGraph(rawGraph) {
           showInspector("Output", rowsOut);
         });
 
-        hitRect.on("click", (event) => {
-          event.stopPropagation();
-          if (expandedHeatmaps.has("__OUTPUT__")) expandedHeatmaps.delete("__OUTPUT__");
-          else expandedHeatmaps.add("__OUTPUT__");
+        g.on("click", function (event) {
+          if (event.button !== 0) return;
+          if (!tensorSupportsProjectionCycling(outputRenderDatum.shapeInfo?.shape, outputRenderDatum.flatValues)) return;
+          cycleTensorProjection(outputRenderDatum.node.id, outputRenderDatum.shapeInfo?.shape, 1);
           renderOperationGraph(currentGraph);
         });
 
-        hitRect.on("dblclick", (event) => {
-          event.stopPropagation();
-          openHeatmapPopup(outputDatum, globalHeatRange);
+        g.on("contextmenu", function (event) {
+          if (!tensorSupportsProjectionCycling(outputRenderDatum.shapeInfo?.shape, outputRenderDatum.flatValues)) return;
+          event.preventDefault();
+          cycleTensorProjection(outputRenderDatum.node.id, outputRenderDatum.shapeInfo?.shape, -1);
+          renderOperationGraph(currentGraph);
         });
 
         g.on("mouseenter", () => {
-          const rows = parameterInspectorRows(outputDatum);
+          const rows = parameterInspectorRows(outputRenderDatum);
           if (currentOutputStats) {
             rows.push(
               { key: "min", value: currentOutputStats.min.toFixed(4) },
@@ -1861,109 +2237,6 @@ async function renderOperationGraph(rawGraph) {
   });
 }
 
-/* ── Heatmap popup ───────────────────────────────────────── */
-
-function openHeatmapPopup(d, rangeOverride = null) {
-  // Remove existing popup if any
-  closeHeatmapPopup();
-
-  const overlay = document.createElement("div");
-  overlay.id = "heatmapPopup";
-  overlay.className = "hm-popup-overlay";
-
-  const card = document.createElement("div");
-  card.className = "hm-popup-card";
-
-  // Close button
-  const closeBtn = document.createElement("button");
-  closeBtn.className = "hm-popup-close";
-  closeBtn.textContent = "\u00d7";
-  closeBtn.addEventListener("click", closeHeatmapPopup);
-  card.appendChild(closeBtn);
-
-  // Title
-  const title = document.createElement("div");
-  title.className = "hm-popup-title";
-  title.textContent = d.node.label;
-  card.appendChild(title);
-
-  // Zoomable heatmap viewport
-  const viewport = document.createElement("div");
-  viewport.className = "hm-popup-viewport";
-  const stage = document.createElement("div");
-  stage.className = "hm-popup-stage";
-  const canvas = document.createElement("canvas");
-  canvas.className = "hm-popup-canvas";
-  stage.appendChild(canvas);
-  viewport.appendChild(stage);
-  card.appendChild(viewport);
-
-  // 1x means base cell size from heatmapBaseCellPx (e.g. 4px small, 2px large).
-  let zoom = 1;
-  const redraw = () => drawZoomableHeatmap(canvas, d.values, zoom, rangeOverride);
-  redraw();
-
-  viewport.addEventListener("wheel", (e) => {
-    e.preventDefault();
-    const factor = Math.exp(-e.deltaY * 0.0015);
-    zoom = Math.max(1, Math.min(80, zoom * factor));
-    redraw();
-  }, { passive: false });
-
-  viewport.addEventListener("dblclick", () => {
-    zoom = 1;
-    redraw();
-  });
-
-  const resizeObserver = new ResizeObserver(() => redraw());
-  resizeObserver.observe(viewport);
-
-  // Stats
-  const st = valuesStats(d.values);
-  if (st) {
-    const stats = document.createElement("div");
-    stats.className = "hm-popup-stats";
-    const lines = [
-      `min: ${st.min.toFixed(6)}`,
-      `max: ${st.max.toFixed(6)}`,
-      `mean: ${st.mean.toFixed(6)}`,
-      `std: ${st.std.toFixed(6)}`,
-    ];
-    if (d.shapeInfo?.shape) lines.push(`shape: ${shapeStr(d.shapeInfo.shape)}`);
-    if (d.shapeInfo?.dtype) lines.push(`dtype: ${d.shapeInfo.dtype}`);
-    if (d.shapeInfo?.bytes != null) lines.push(`size: ${bytesStr(d.shapeInfo.bytes)}`);
-    stats.innerHTML = lines.map(l => `<div>${l}</div>`).join("");
-    card.appendChild(stats);
-  }
-
-  const hint = document.createElement("div");
-  hint.className = "hm-popup-hint";
-  hint.textContent = "Wheel: zoom | Double-click: reset | Values appear when zoomed in";
-  card.appendChild(hint);
-
-  overlay.appendChild(card);
-  document.body.appendChild(overlay);
-
-  // Close on overlay click (not card)
-  overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) closeHeatmapPopup();
-  });
-
-  // Close on Escape
-  overlay._cleanup = () => resizeObserver.disconnect();
-  overlay._escHandler = (e) => { if (e.key === "Escape") closeHeatmapPopup(); };
-  document.addEventListener("keydown", overlay._escHandler);
-}
-
-function closeHeatmapPopup() {
-  const existing = document.getElementById("heatmapPopup");
-  if (existing) {
-    if (existing._cleanup) existing._cleanup();
-    if (existing._escHandler) document.removeEventListener("keydown", existing._escHandler);
-    existing.remove();
-  }
-}
-
 /* ── Controls ───────────────────────────────────────────── */
 
 function updateCollapseButton() {
@@ -1971,60 +2244,176 @@ function updateCollapseButton() {
   collapseBtn.textContent = allCollapsed ? "Expand All" : "Collapse All";
 }
 
+function canToggleCollapseAll() {
+  if (!currentGraph) return false;
+  const tops = getTopLevelPrefixes(currentGraph);
+  for (const top of tops) {
+    if (getChildPrefixes(currentGraph, top).size > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function toggleCollapseAll() {
+  if (!canToggleCollapseAll()) return;
+  if (allCollapsed) {
+    collapsedGroups.clear();
+    allCollapsed = false;
+  } else {
+    collapsedGroups.clear();
+    const tops = getTopLevelPrefixes(currentGraph);
+    tops.forEach((t) => collapsedGroups.add(t));
+    allCollapsed = true;
+  }
+  updateCollapseButton();
+  renderOperationGraph(currentGraph);
+}
+
 if (collapseBtn) {
   collapseBtn.addEventListener("click", () => {
-    if (!currentGraph) return;
-    if (allCollapsed) {
-      collapsedGroups.clear();
-      allCollapsed = false;
+    toggleCollapseAll();
+  });
+}
+
+let lastBackgroundRightClick = 0;
+const backgroundDoubleRightMs = 360;
+
+function isGraphBackgroundTarget(target) {
+  if (!(target instanceof Element)) return false;
+  return !target.closest(
+    ".node, .param-node, .io-node, .group-hull, .graph-input-shape"
+  );
+}
+
+if (vizEl) {
+  vizEl.addEventListener("dblclick", (event) => {
+    if (!isGraphBackgroundTarget(event.target)) return;
+    if (!canToggleCollapseAll()) return;
+    event.preventDefault();
+    toggleCollapseAll();
+  });
+
+  vizEl.addEventListener("contextmenu", (event) => {
+    if (!isGraphBackgroundTarget(event.target)) return;
+    if (!canToggleCollapseAll()) return;
+    event.preventDefault();
+    const now = performance.now();
+    if (now - lastBackgroundRightClick <= backgroundDoubleRightMs) {
+      lastBackgroundRightClick = 0;
+      toggleCollapseAll();
     } else {
-      collapsedGroups.clear();
-      const tops = getTopLevelPrefixes(currentGraph);
-      tops.forEach((t) => collapsedGroups.add(t));
-      allCollapsed = true;
+      lastBackgroundRightClick = now;
     }
-    updateCollapseButton();
-    renderOperationGraph(currentGraph);
   });
 }
 
 function updateShapesButton() {
   if (!shapesBtn) return;
-  shapesBtn.textContent = showShapes ? "Names" : "Shapes";
+  shapesBtn.textContent = "Shapes";
+  shapesBtn.setAttribute("aria-pressed", showShapes ? "true" : "false");
+  shapesBtn.classList.toggle("is-active", showShapes);
+}
+
+function updateDefaultButton() {
+  if (!defaultBtn) return;
+  const isDefault = !showShapes && !showHeatmaps;
+  defaultBtn.textContent = "Default";
+  defaultBtn.setAttribute("aria-pressed", isDefault ? "true" : "false");
+  defaultBtn.classList.toggle("is-active", isDefault);
 }
 
 if (shapesBtn) {
   shapesBtn.addEventListener("click", () => {
     showShapes = !showShapes;
+    updateDefaultButton();
     updateShapesButton();
     if (currentGraph) renderOperationGraph(currentGraph);
   });
 }
 
+if (defaultBtn) {
+  defaultBtn.addEventListener("click", () => {
+    showShapes = false;
+    showHeatmaps = false;
+    // Explicit default view clears any selectively forced parameter heatmaps.
+    selectiveParamHeatmaps.clear();
+    updateDefaultButton();
+    updateShapesButton();
+    updateHeatmapButton();
+    if (currentGraph) renderOperationGraph(currentGraph);
+  });
+}
+
 if (themeBtn) {
+  const validThemeMode = (mode) => mode === "auto" || mode === "light" || mode === "dark";
+
+  const resolveLightTheme = () => {
+    if (themeMode === "light") return true;
+    if (themeMode === "dark") return false;
+    return systemLightQuery ? systemLightQuery.matches : true;
+  };
+
+  const syncThemeButton = () => {
+    const isLight = resolveLightTheme();
+    document.documentElement.classList.toggle("light", isLight);
+    themeBtn.textContent = themeMode === "auto"
+      ? "Auto"
+      : themeMode === "light"
+        ? "Light"
+        : "Dark";
+    themeBtn.classList.toggle("is-light", isLight);
+    themeBtn.classList.toggle("is-auto", themeMode === "auto");
+    themeBtn.setAttribute("aria-label", `Theme mode: ${themeMode}. Click to switch theme mode.`);
+  };
+
   themeBtn.addEventListener("click", () => {
-    document.documentElement.classList.toggle("light");
-    const isLight = document.documentElement.classList.contains("light");
-    themeBtn.textContent = isLight ? "Dark" : "Light";
+    themeMode = themeMode === "auto" ? "dark" : themeMode === "dark" ? "light" : "auto";
+    try {
+      localStorage.setItem("eqxview.themeMode", themeMode);
+    } catch (_) {}
+    syncThemeButton();
   });
 
-  // Start in light mode by default.
-  document.documentElement.classList.add("light");
-  themeBtn.textContent = "Dark";
+  try {
+    const savedThemeMode = localStorage.getItem("eqxview.themeMode");
+    if (validThemeMode(savedThemeMode)) themeMode = savedThemeMode;
+  } catch (_) {}
+
+  if (systemLightQuery) {
+    const onSystemThemeChange = () => {
+      if (themeMode === "auto") syncThemeButton();
+    };
+    if (typeof systemLightQuery.addEventListener === "function") {
+      systemLightQuery.addEventListener("change", onSystemThemeChange);
+    } else if (typeof systemLightQuery.addListener === "function") {
+      systemLightQuery.addListener(onSystemThemeChange);
+    }
+  }
+
+  syncThemeButton();
 }
 
 function updateHeatmapButton() {
   if (!heatmapBtn) return;
-  heatmapBtn.textContent = showHeatmaps ? "Hide Heatmaps" : "Heatmaps";
+  heatmapBtn.textContent = "Heatmaps";
+  heatmapBtn.setAttribute("aria-pressed", showHeatmaps ? "true" : "false");
+  heatmapBtn.classList.toggle("is-active", showHeatmaps);
 }
 
 if (heatmapBtn) {
   heatmapBtn.addEventListener("click", () => {
     showHeatmaps = !showHeatmaps;
+    updateDefaultButton();
     updateHeatmapButton();
     if (currentGraph) renderOperationGraph(currentGraph);
   });
 }
+
+updateCollapseButton();
+updateDefaultButton();
+updateShapesButton();
+updateHeatmapButton();
 
 async function loadModelTreeFromFile(file) {
   if (!file) {
@@ -2032,6 +2421,7 @@ async function loadModelTreeFromFile(file) {
     return;
   }
   setStatus(`Loading ${file.name}...`);
+  setProcessing(true, `Processing ${file.name}...`);
 
   const formData = new FormData();
   formData.append("file", file);
@@ -2077,6 +2467,8 @@ async function loadModelTreeFromFile(file) {
     }
   } catch (err) {
     setStatus(err.message || "Failed to load model.", true);
+  } finally {
+    setProcessing(false);
   }
 }
 
@@ -2087,6 +2479,13 @@ function overlayOn() {
 
 function overlayOff() {
   dropOverlayEl.classList.remove("active");
+}
+
+function setProcessing(active, text = "Processing model...") {
+  if (!processingOverlayEl) return;
+  if (processingTextEl) processingTextEl.textContent = text;
+  processingOverlayEl.classList.toggle("active", !!active);
+  processingOverlayEl.setAttribute("aria-hidden", active ? "false" : "true");
 }
 
 window.addEventListener("dragenter", (event) => {

@@ -5,11 +5,137 @@ from importlib import import_module
 from io import BytesIO
 from pathlib import Path
 import tempfile
-from typing import Any
+from typing import Any, Callable
 import zipfile
 
 import cloudpickle
 import equinox as eqx
+
+
+class LoadedModel:
+    """Container describing a loaded model artifact.
+
+    `parameter_tree` is used for architecture introspection/visualization.
+    `run_fn` is optional and should accept one input tensor-like argument.
+    """
+
+    def __init__(
+        self,
+        *,
+        framework: str,
+        model: Any,
+        parameter_tree: Any,
+        run_fn: Callable[[Any], Any] | None,
+    ) -> None:
+        self.framework = framework
+        self.model = model
+        self.parameter_tree = parameter_tree
+        self.run_fn = run_fn
+
+
+def _as_loaded_eqx(model: Any) -> LoadedModel:
+    return LoadedModel(
+        framework="equinox",
+        model=model,
+        parameter_tree=model,
+        run_fn=lambda x: model(x),
+    )
+
+
+def _import_flax_linen_module_class():
+    try:
+        from flax import linen as nn  # type: ignore
+
+        return nn.Module
+    except Exception:
+        return None
+
+
+def _is_flax_module_instance(obj: Any) -> bool:
+    module_cls = _import_flax_linen_module_class()
+    if module_cls is None:
+        return False
+    return isinstance(obj, module_cls)
+
+
+def _normalize_flax_variables(variables: Any) -> Any:
+    """Return a mutable mapping-like variables tree when possible."""
+    try:
+        # Flax FrozenDict exposes `.unfreeze()`.
+        if hasattr(variables, "unfreeze") and callable(variables.unfreeze):
+            return variables.unfreeze()
+    except Exception:
+        pass
+    return variables
+
+
+def _flax_parameter_tree(variables: Any) -> Any:
+    norm = _normalize_flax_variables(variables)
+    if isinstance(norm, dict) and "params" in norm:
+        return norm["params"]
+    return norm
+
+
+def _build_flax_run_fn(module: Any, variables: Any) -> Callable[[Any], Any]:
+    """Build a tolerant apply wrapper for Flax modules.
+
+    Tries a few common calling conventions without hard-coding architecture.
+    """
+
+    norm_vars = _normalize_flax_variables(variables)
+
+    def _runner(x: Any):
+        attempts: list[tuple[Any, dict[str, Any]]] = []
+        attempts.append((norm_vars, {}))
+        if isinstance(norm_vars, dict) and "params" not in norm_vars:
+            attempts.append(({"params": norm_vars}, {}))
+        attempts.append((norm_vars, {"train": False}))
+        if isinstance(norm_vars, dict) and "params" not in norm_vars:
+            attempts.append(({"params": norm_vars}, {"train": False}))
+
+        last_exc: Exception | None = None
+        for vars_arg, kwargs in attempts:
+            try:
+                return module.apply(vars_arg, x, **kwargs)
+            except Exception as exc:  # pragma: no cover - best-effort fallbacks
+                last_exc = exc
+                continue
+        if last_exc is not None:
+            raise last_exc
+        return module.apply(norm_vars, x)
+
+    return _runner
+
+
+def _as_loaded_flax(module: Any, variables: Any) -> LoadedModel:
+    return LoadedModel(
+        framework="flax",
+        model={"module": module, "variables": variables},
+        parameter_tree=_flax_parameter_tree(variables),
+        run_fn=_build_flax_run_fn(module, variables),
+    )
+
+
+def _extract_flax_from_obj(obj: Any) -> LoadedModel | None:
+    """Try to coerce pickle payloads into a Flax loaded model."""
+
+    # Common tuple shape: (module, variables)
+    if isinstance(obj, tuple) and len(obj) == 2:
+        module, variables = obj
+        if _is_flax_module_instance(module):
+            return _as_loaded_flax(module, variables)
+
+    # Common dict shape with explicit keys.
+    if isinstance(obj, dict):
+        module = obj.get("module") or obj.get("model")
+        variables = obj.get("variables")
+        if variables is None:
+            # Allow params-only payloads.
+            variables = obj.get("params")
+        if module is not None and variables is not None and _is_flax_module_instance(module):
+            return _as_loaded_flax(module, variables)
+
+    return None
 
 
 class ModelLoadError(RuntimeError):
@@ -83,7 +209,11 @@ def load_model_from_pickle_bytes(content: bytes):
     except Exception as exc:
         raise ModelLoadError(f"Failed to deserialize cloudpickle file: {exc}") from exc
 
-    return model
+    flax_loaded = _extract_flax_from_obj(model)
+    if flax_loaded is not None:
+        return flax_loaded
+
+    return _as_loaded_eqx(model)
 
 
 def save_model_bundle(
@@ -163,7 +293,7 @@ def load_model_from_eqx_bundle_bytes(content: bytes):
     except Exception as exc:
         raise ModelLoadError(f"Failed to restore model from eqxbundle: {exc}") from exc
 
-    return model
+    return _as_loaded_eqx(model)
 
 
 def load_uploaded_model(filename: str, content: bytes):

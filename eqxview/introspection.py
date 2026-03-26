@@ -7,6 +7,7 @@ import jax
 import numpy as np
 
 from eqxview._capture import Capture as _Capture
+from eqxview.tensor_projection import flat_values_for_client, to_heatmap_2d
 
 
 @dataclass
@@ -50,49 +51,19 @@ def _leaf_metrics(leaf: Any) -> tuple[int, int, list[int] | None, str | None]:
     return 0, 0, None, None
 
 
-_HEATMAP_MAX = 5000  # max pixels per dimension in the heatmap thumbnail
-
-
 def _downsample_for_heatmap(leaf: Any) -> list[list[float]] | None:
     """Return a 2D nested list suitable for heatmap rendering.
 
     • 1D → single-row 2D
     • 2D → as-is (downsampled if large)
-    • 3D+ → first 2D slice along leading dims
+    • 3D+ → folded into a 2D matrix so all values remain visible
     • Scalars / non-arrays → None
     """
     if not hasattr(leaf, "shape") or not hasattr(leaf, "dtype"):
         return None
-    shape = leaf.shape
-    if len(shape) == 0:
+    if len(leaf.shape) == 0:
         return None
-
-    arr = np.asarray(leaf, dtype=np.float32)
-
-    # Reduce to 2D
-    if arr.ndim == 1:
-        arr = arr.reshape(1, -1)
-    elif arr.ndim > 2:
-        # Take the first slice along every leading dimension
-        while arr.ndim > 2:
-            arr = arr[0]
-
-    rows, cols = arr.shape
-    # Uniform downsample – both axes shrink by the same factor so cells
-    # stay square.  The larger axis becomes _HEATMAP_MAX; the smaller
-    # axis shrinks proportionally.
-    max_dim = max(rows, cols)
-    if max_dim > _HEATMAP_MAX:
-        new_rows = max(1, round(rows * _HEATMAP_MAX / max_dim))
-        new_cols = max(1, round(cols * _HEATMAP_MAX / max_dim))
-        if new_rows < rows:
-            idx = np.linspace(0, rows - 1, new_rows, dtype=int)
-            arr = arr[idx]
-        if new_cols < cols:
-            idx = np.linspace(0, cols - 1, new_cols, dtype=int)
-            arr = arr[:, idx]
-
-    return arr.tolist()
+    return to_heatmap_2d(leaf, max_size=5000)
 
 
 def _flatten_with_path(
@@ -277,13 +248,20 @@ def _collect_leaf_groups(
             _collect_leaf_groups(child, path + [child.get("name", "node")], out)
 
 
-def build_operation_graph(model: Any) -> dict[str, Any]:
-    """Build a linear computation-style graph with tensor-labeled incoming edges."""
-    tree_payload = build_model_tree(model)
+def build_operation_graph(model: Any, parameter_tree: Any | None = None) -> dict[str, Any]:
+    """Build an architecture-agnostic operation graph from parameter groups.
+
+    The graph is intentionally generic: each parameter group contributes one
+    operation node, with all leaf tensors connected as parameter edges.
+    """
+    param_source = model if parameter_tree is None else parameter_tree
+    tree_payload = build_model_tree(param_source)
     root = tree_payload["tree"]
 
-    # Build a path-string → actual leaf array map for heatmap data
-    keyed_leaves = _flatten_with_path(model)
+    # Build a path-string → actual leaf array map for heatmap data.
+    # This must come from the same parameter tree used to build the graph,
+    # otherwise frameworks like Flax end up with graph nodes but no heatmap values.
+    keyed_leaves = _flatten_with_path(param_source)
     _leaf_arrays: dict[str, Any] = {}
     for path, leaf in keyed_leaves:
         parts = [_path_item_to_string(p) for p in path]
@@ -297,6 +275,13 @@ def build_operation_graph(model: Any) -> dict[str, Any]:
         arr = _leaf_arrays.get(key)
         if arr is not None:
             return _downsample_for_heatmap(arr)
+        return None
+
+    def _flat_values_for(group_path: list[str], leaf_name: str) -> list[float] | None:
+        key = "/".join(group_path[1:] + [leaf_name])
+        arr = _leaf_arrays.get(key)
+        if arr is not None:
+            return flat_values_for_client(arr)
         return None
 
     op_nodes: list[dict[str, Any]] = []
@@ -313,10 +298,12 @@ def build_operation_graph(model: Any) -> dict[str, Any]:
 
     # --- Capture detection -------------------------------------------------
     # Find all Capture wrappers so their op nodes can be annotated.
+    # This only applies when `model` is an Equinox module tree.
     _capture_at_path: dict[str, str] = {}
-    for _iter_path, _mod in iter_module_paths(model):
-        if isinstance(_mod, _Capture):
-            _capture_at_path[_iter_path] = _mod.name
+    if hasattr(model, "__dataclass_fields__"):
+        for _iter_path, _mod in iter_module_paths(model):
+            if isinstance(_mod, _Capture):
+                _capture_at_path[_iter_path] = _mod.name
 
     def _strip_capture_module_segment(path: str) -> str:
         """Hide redundant Capture internals, e.g. `embedding/module/...` -> `embedding/...`."""
@@ -369,25 +356,28 @@ def build_operation_graph(model: Any) -> dict[str, Any]:
         )
         group_id = _strip_capture_module_segment(raw_group_id)
         group_path = _strip_capture_module_segment(raw_group_path)
-        leaves_by_name = {
-            leaf.get("name", "tensor"): leaf
-            for leaf in group["leaves"]
-            if leaf.get("shape") is not None
-        }
+        leaves = [
+            leaf for leaf in group["leaves"] if leaf.get("shape") is not None
+        ]
+        leaves.sort(key=lambda leaf: _natural_key(str(leaf.get("name", "tensor"))))
 
         _cap_info = _capture_for_group_id(group_id)
         _cap_path = _cap_info[0] if _cap_info else None
         _cap_name = _cap_info[1] if _cap_info else None
 
-        matmul_id = add_op_node(
-            f"MatMul {idx}", f"{group_path}/matmul",
-            group=group_id, capture_path=_cap_path, capture_name=_cap_name,
+        node_label = group.get("name") or f"group_{idx}"
+        op_id = add_op_node(
+            node_label,
+            f"{group_path}/op",
+            group=group_id,
+            capture_path=_cap_path,
+            capture_name=_cap_name,
         )
         if prev_id is None:
             op_edges.append(
                 {
                     "source": None,
-                    "target": matmul_id,
+                    "target": op_id,
                     "label": "input",
                     "kind": "flow",
                     "shape": None,
@@ -398,7 +388,7 @@ def build_operation_graph(model: Any) -> dict[str, Any]:
             op_edges.append(
                 {
                     "source": prev_id,
-                    "target": matmul_id,
+                    "target": op_id,
                     "label": "x",
                     "kind": "flow",
                     "shape": None,
@@ -406,73 +396,24 @@ def build_operation_graph(model: Any) -> dict[str, Any]:
                 }
             )
 
-        weight_leaf = leaves_by_name.get("weight")
-        if weight_leaf is not None:
-            w_shape = weight_leaf.get("shape")
-            w_dtype = weight_leaf.get("dtype")
+        for leaf in leaves:
+            leaf_name = str(leaf.get("name", "tensor"))
+            leaf_shape = leaf.get("shape")
+            leaf_dtype = leaf.get("dtype")
             op_edges.append(
                 {
                     "source": None,
-                    "target": matmul_id,
-                    "label": _edge_label("weight", w_shape, w_dtype),
+                    "target": op_id,
+                    "label": _edge_label(leaf_name, leaf_shape, leaf_dtype),
                     "kind": "parameter",
-                    "shape": w_shape,
-                    "dtype": w_dtype,
-                    "values": _heatmap_for(group["path"], "weight"),
+                    "shape": leaf_shape,
+                    "dtype": leaf_dtype,
+                    "values": _heatmap_for(group["path"], leaf_name),
+                    "flat_values": _flat_values_for(group["path"], leaf_name),
                 }
             )
 
-        stage_out = matmul_id
-        bias_leaf = leaves_by_name.get("bias")
-        if bias_leaf is not None:
-            b_shape = bias_leaf.get("shape")
-            b_dtype = bias_leaf.get("dtype")
-            addbias_id = add_op_node(
-                f"AddBias {idx}", f"{group_path}/addbias",
-                group=group_id, capture_path=_cap_path, capture_name=_cap_name,
-            )
-            op_edges.append(
-                {
-                    "source": stage_out,
-                    "target": addbias_id,
-                    "label": "x",
-                    "kind": "flow",
-                    "shape": None,
-                    "dtype": None,
-                }
-            )
-            op_edges.append(
-                {
-                    "source": None,
-                    "target": addbias_id,
-                    "label": _edge_label("bias", b_shape, b_dtype),
-                    "kind": "parameter",
-                    "shape": b_shape,
-                    "dtype": b_dtype,
-                    "values": _heatmap_for(group["path"], "bias"),
-                }
-            )
-            stage_out = addbias_id
-
-        is_last_group = idx == (len(groups) - 1)
-        if not is_last_group:
-            act_id = add_op_node(
-                f"Activation {idx}", f"{group_path}/activation",
-                group=group_id, capture_path=_cap_path, capture_name=_cap_name,
-            )
-            op_edges.append(
-                {
-                    "source": stage_out,
-                    "target": act_id,
-                    "label": "x",
-                    "kind": "flow",
-                    "shape": None,
-                    "dtype": None,
-                }
-            )
-            stage_out = act_id
-
-        prev_id = stage_out
+        prev_id = op_id
 
     return {
         "summary": tree_payload["summary"],
