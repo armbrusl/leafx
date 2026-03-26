@@ -1,6 +1,6 @@
-# eqxview
+# leafx
 
-eqxview is a local browser visualizer for Equinox model hierarchies.
+leafx is a local browser visualizer for Equinox model hierarchies.
 
 Current scope:
 - load a serialized model by dragging a file into the browser window
