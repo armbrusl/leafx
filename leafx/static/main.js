@@ -2370,13 +2370,13 @@ if (themeBtn) {
   themeBtn.addEventListener("click", () => {
     themeMode = themeMode === "auto" ? "dark" : themeMode === "dark" ? "light" : "auto";
     try {
-      localStorage.setItem("eqxview.themeMode", themeMode);
+      localStorage.setItem("leafx.themeMode", themeMode);
     } catch (_) {}
     syncThemeButton();
   });
 
   try {
-    const savedThemeMode = localStorage.getItem("eqxview.themeMode");
+    const savedThemeMode = localStorage.getItem("leafx.themeMode") ?? localStorage.getItem("eqxview.themeMode");
     if (validThemeMode(savedThemeMode)) themeMode = savedThemeMode;
   } catch (_) {}
 

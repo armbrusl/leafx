@@ -12,13 +12,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from eqxview._capture import Capture
-from eqxview.introspection import build_operation_graph, iter_module_paths
-from eqxview.model_loading import LoadedModel, ModelLoadError, load_uploaded_model
-from eqxview.tensor_projection import flat_values_for_client, to_heatmap_2d
+from leafx._capture import Capture
+from leafx.introspection import build_operation_graph, iter_module_paths
+from leafx.model_loading import LoadedModel, ModelLoadError, load_uploaded_model
+from leafx.tensor_projection import flat_values_for_client, to_heatmap_2d
 
 
-app = FastAPI(title="eqxview", version="0.1.0")
+app = FastAPI(title="leafx", version="0.1.0")
 CURRENT_LOADED: LoadedModel | None = None
 
 static_dir = Path(__file__).parent / "static"
@@ -29,9 +29,12 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 def index() -> FileResponse:
     return FileResponse(static_dir / "index.html")
 
+
 def _pick_primary_array_leaf(output_value: Any) -> Any:
     leaves = jax.tree_util.tree_leaves(output_value)
-    array_like = [leaf for leaf in leaves if hasattr(leaf, "shape") and hasattr(leaf, "dtype")]
+    array_like = [
+        leaf for leaf in leaves if hasattr(leaf, "shape") and hasattr(leaf, "dtype")
+    ]
     if not array_like:
         raise ValueError("Model output did not contain any array-like leaves.")
     return array_like[0]
@@ -70,7 +73,7 @@ def _run_model_with_capture(
 
     Patches ``eqx.nn.Embedding.__call__`` to handle batched integer indices
     automatically (via vmap), and patches ``Capture.__call__`` to record outputs
-    for every ``eqxview.Capture``-wrapped submodule, keyed by module path.
+    for every ``leafx.Capture``-wrapped submodule, keyed by module path.
     """
 
     # Map id(capture_instance) -> path string for every Capture in the model.
@@ -160,7 +163,9 @@ async def run_current_model(input_file: UploadFile = File(...)) -> dict[str, Any
         raw = await input_file.read()
         np_input = np.load(BytesIO(raw), allow_pickle=False)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to read .npy input: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Failed to read .npy input: {exc}"
+        ) from exc
 
     model_input = jnp.asarray(np_input)
     try:
@@ -183,7 +188,9 @@ async def run_current_model(input_file: UploadFile = File(...)) -> dict[str, Any
     try:
         output_leaf = _pick_primary_array_leaf(output_value)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Output parsing failed: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Output parsing failed: {exc}"
+        ) from exc
 
     output_np = np.asarray(output_leaf)
     heatmap = to_heatmap_2d(output_np, max_size=64)

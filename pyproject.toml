@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "eqxview"
+name = "leafx"
 version = "0.1.0"
-description = "Local browser visualizer for Equinox model hierarchies"
+description = "Local browser visualizer for Equinox and Flax model hierarchies"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -20,4 +20,4 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["eqxview*"]
+include = ["leafx*"]

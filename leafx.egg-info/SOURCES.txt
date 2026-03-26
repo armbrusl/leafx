@@ -5,6 +5,7 @@ leafx/_capture.py
 leafx/app.py
 leafx/introspection.py
 leafx/model_loading.py
+leafx/tensor_projection.py
 leafx.egg-info/PKG-INFO
 leafx.egg-info/SOURCES.txt
 leafx.egg-info/dependency_links.txt

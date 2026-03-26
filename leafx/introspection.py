@@ -6,8 +6,8 @@ from typing import Any
 import jax
 import numpy as np
 
-from eqxview._capture import Capture as _Capture
-from eqxview.tensor_projection import flat_values_for_client, to_heatmap_2d
+from leafx._capture import Capture as _Capture
+from leafx.tensor_projection import flat_values_for_client, to_heatmap_2d
 
 
 @dataclass
@@ -248,7 +248,9 @@ def _collect_leaf_groups(
             _collect_leaf_groups(child, path + [child.get("name", "node")], out)
 
 
-def build_operation_graph(model: Any, parameter_tree: Any | None = None) -> dict[str, Any]:
+def build_operation_graph(
+    model: Any, parameter_tree: Any | None = None
+) -> dict[str, Any]:
     """Build an architecture-agnostic operation graph from parameter groups.
 
     The graph is intentionally generic: each parameter group contributes one
@@ -356,9 +358,7 @@ def build_operation_graph(model: Any, parameter_tree: Any | None = None) -> dict
         )
         group_id = _strip_capture_module_segment(raw_group_id)
         group_path = _strip_capture_module_segment(raw_group_path)
-        leaves = [
-            leaf for leaf in group["leaves"] if leaf.get("shape") is not None
-        ]
+        leaves = [leaf for leaf in group["leaves"] if leaf.get("shape") is not None]
         leaves.sort(key=lambda leaf: _natural_key(str(leaf.get("name", "tensor"))))
 
         _cap_info = _capture_for_group_id(group_id)

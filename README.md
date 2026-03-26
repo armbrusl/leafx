@@ -1,6 +1,6 @@
 # leafx
 
-leafx is a local browser visualizer for Equinox model hierarchies.
+leafx is a local browser visualizer for Equinox and Flax model hierarchies.
 
 Current scope:
 - load a serialized model by dragging a file into the browser window
@@ -14,7 +14,7 @@ Current scope:
 1. Activate your environment:
 
 ```bash
-cd /home/users/armbrust/projects/eqxview
+cd /home/users/armbrust/projects/leafx
 source .venv/bin/activate
 ```
 
@@ -27,7 +27,7 @@ uv sync
 3. Start the local server:
 
 ```bash
-uv run uvicorn eqxview.app:app --reload --host 127.0.0.1 --port 8000
+uv run uvicorn leafx.app:app --reload --host 127.0.0.1 --port 8000
 ```
 
 4. Open in browser:
@@ -68,7 +68,7 @@ Example exporter:
 import jax.random as jr
 
 from example_models import make_mlp
-from eqxview.model_loading import save_model_bundle
+from leafx.model_loading import save_model_bundle
 
 model = make_mlp(in_size=32, out_size=4, width=64, depth=3, seed=0)
 save_model_bundle(
@@ -85,7 +85,7 @@ when possible, and keep all model loading local to trusted code.
 ## Run inference from browser input
 
 After loading a model, drop a `.npy` tensor directly onto the `INPUT` node.
-eqxview will run a forward pass on the loaded model and populate the `OUTPUT` node
+leafx will run a forward pass on the loaded model and populate the `OUTPUT` node
 with inferred output shape and a heatmap preview of output values.
 
 ## Notes for large models

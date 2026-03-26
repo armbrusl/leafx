@@ -132,7 +132,11 @@ def _extract_flax_from_obj(obj: Any) -> LoadedModel | None:
         if variables is None:
             # Allow params-only payloads.
             variables = obj.get("params")
-        if module is not None and variables is not None and _is_flax_module_instance(module):
+        if (
+            module is not None
+            and variables is not None
+            and _is_flax_module_instance(module)
+        ):
             return _as_loaded_flax(module, variables)
 
     return None
@@ -145,6 +149,8 @@ class ModelLoadError(RuntimeError):
 EQX_BUNDLE_MANIFEST = "manifest.json"
 EQX_BUNDLE_WEIGHTS = "model.eqx"
 EQX_BUNDLE_VERSION = 1
+EQX_BUNDLE_FORMAT = "leafx.eqxbundle"
+LEGACY_EQX_BUNDLE_FORMATS = {EQX_BUNDLE_FORMAT, "eqxview.eqxbundle"}
 
 
 def _resolve_factory(factory_spec: str):
@@ -233,7 +239,7 @@ def save_model_bundle(
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
 
     manifest = {
-        "format": "eqxview.eqxbundle",
+        "format": EQX_BUNDLE_FORMAT,
         "version": EQX_BUNDLE_VERSION,
         "factory": factory_spec,
         "factory_kwargs": factory_kwargs or {},
@@ -245,7 +251,9 @@ def save_model_bundle(
         eqx.tree_serialise_leaves(str(weights_path), model)
 
         with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(EQX_BUNDLE_MANIFEST, json.dumps(manifest, indent=2, sort_keys=True))
+            zf.writestr(
+                EQX_BUNDLE_MANIFEST, json.dumps(manifest, indent=2, sort_keys=True)
+            )
             zf.write(weights_path, arcname=EQX_BUNDLE_WEIGHTS)
 
     return bundle_path
@@ -267,7 +275,7 @@ def load_model_from_eqx_bundle_bytes(content: bytes):
     except Exception as exc:
         raise ModelLoadError(f"Failed to read eqxbundle: {exc}") from exc
 
-    if manifest.get("format") != "eqxview.eqxbundle":
+    if manifest.get("format") not in LEGACY_EQX_BUNDLE_FORMATS:
         raise ModelLoadError("Unsupported eqxbundle format.")
     if manifest.get("version") != EQX_BUNDLE_VERSION:
         raise ModelLoadError(
@@ -280,10 +288,14 @@ def load_model_from_eqx_bundle_bytes(content: bytes):
 
     factory_kwargs = manifest.get("factory_kwargs")
     if factory_kwargs is not None and not isinstance(factory_kwargs, dict):
-        raise ModelLoadError("eqxbundle manifest field 'factory_kwargs' must be a dict.")
+        raise ModelLoadError(
+            "eqxbundle manifest field 'factory_kwargs' must be a dict."
+        )
 
     try:
-        model = load_model(factory_spec=factory_spec, factory_kwargs=factory_kwargs or {})
+        model = load_model(
+            factory_spec=factory_spec, factory_kwargs=factory_kwargs or {}
+        )
         with tempfile.NamedTemporaryFile(suffix=".eqx") as tmp:
             tmp.write(weights)
             tmp.flush()

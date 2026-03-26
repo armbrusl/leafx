@@ -83,7 +83,7 @@ Example exporter:
 import jax.random as jr
 
 from example_models import make_mlp
-from eqxview.model_loading import save_model_bundle
+from leafx.model_loading import save_model_bundle
 
 model = make_mlp(in_size=32, out_size=4, width=64, depth=3, seed=0)
 save_model_bundle(
@@ -100,7 +100,7 @@ when possible, and keep all model loading local to trusted code.
 ## Run inference from browser input
 
 After loading a model, drop a `.npy` tensor directly onto the `INPUT` node.
-eqxview will run a forward pass on the loaded model and populate the `OUTPUT` node
+leafx will run a forward pass on the loaded model and populate the `OUTPUT` node
 with inferred output shape and a heatmap preview of output values.
 
 ## Notes for large models
