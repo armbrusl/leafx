@@ -1,6 +1,7 @@
-# leafx
+# leafx:  a local browser visualizer for Equinox and Flax model hierarchies.
 
-leafx is a local browser visualizer for Equinox and Flax model hierarchies.
+![leafx is a local browser visualizer for Equinox and Flax model hierarchies.
+](leafx_ex.png)
 
 Current scope:
 - load a serialized model by dragging a file into the browser window
